@@ -395,10 +395,6 @@ export function ShareProjectDialog({
       setSharesError(null);
       setActiveShares([]);
       setLoadingShares(false);
-
-      if (hasToken) {
-        void loadActiveShares();
-      }
     } else {
       abortRef.current?.abort();
       abortRef.current = null;
@@ -409,7 +405,14 @@ export function ShareProjectDialog({
       revokeAbortRef.current = null;
       setRevokingId(null);
     }
-  }, [open, currentTitle, hasToken, loadActiveShares]);
+  }, [open, currentTitle]);
+
+  // Load the Manage tab's list separately from the reset above, so a sign-in or
+  // token change while the dialog is open refreshes the list without wiping
+  // the create form.
+  useEffect(() => {
+    if (open && hasToken) void loadActiveShares();
+  }, [open, hasToken, loadActiveShares]);
 
   // Pre-flight the project's data sources when the dialog opens, so the author
   // learns that a layer will be empty for everyone else *before* the upload
