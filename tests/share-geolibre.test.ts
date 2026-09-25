@@ -423,6 +423,13 @@ describe("uploadProjectToShare", () => {
     assert.equal(result.role, "view");
     assert.deepEqual(result.unconfirmedSettings, ["role"]);
   });
+
+  it("does not treat an unknown role as confirming a requested view role", async () => {
+    const { fn } = fakeFetch(201, { project: { ...PROJECT_DTO, role: "owner" } });
+    const result = await uploadProjectToShare({ ...baseArgs, role: "view", fetchImpl: fn });
+    assert.equal(result.role, "view");
+    assert.deepEqual(result.unconfirmedSettings, ["role"]);
+  });
 });
 
 describe("fetchProjectShares", () => {

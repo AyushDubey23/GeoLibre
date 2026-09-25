@@ -351,7 +351,9 @@ export async function uploadProjectToShare(
   // "edit" is the full-access default, so a server that ignores the role field
   // still honors it; a restricted role, an expiry, or a password must be echoed.
   const unconfirmedSettings: ShareLinkSetting[] = [];
-  if (options.role && options.role !== "edit" && role !== options.role) {
+  // Compared on the raw value: an unknown role normalizes to "view", which
+  // must not read as confirming a requested "view".
+  if (options.role && options.role !== "edit" && project.role !== options.role) {
     unconfirmedSettings.push("role");
   }
   if (options.expiresIn && !project.expiresAt) unconfirmedSettings.push("expiry");

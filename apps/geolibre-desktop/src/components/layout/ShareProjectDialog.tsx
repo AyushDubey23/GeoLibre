@@ -549,7 +549,11 @@ export function ShareProjectDialog({
     // not be enough to do it. `window.confirm` is blocking and matches how the
     // rest of the app gates destructive actions.
     if (!window.confirm(t("share.revokeConfirm"))) return;
-    revokeAbortRef.current?.abort();
+    // One revocation at a time: every revoke button is disabled while one is
+    // pending, and this guards a second click before that state renders. A
+    // superseding abort would drop the first result, leaving a revoked row
+    // listed or an unrevoked share with no error.
+    if (revokeAbortRef.current) return;
     const controller = new AbortController();
     revokeAbortRef.current = controller;
     setRevokingId(shareId);
@@ -1078,7 +1082,7 @@ export function ShareProjectDialog({
                               revokingId === s.id ? t("share.revoking") : t("share.revoke")
                             }
                             title={t("share.revoke")}
-                            disabled={revokingId === s.id}
+                            disabled={revokingId !== null}
                             onClick={() => void handleRevoke(s.id)}
                           >
                             {revokingId === s.id ? (
