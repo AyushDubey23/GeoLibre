@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { Feature, FeatureCollection } from "geojson";
-import maplibregl from "maplibre-gl";
-import type { MapController } from "@geolibre/map";
+import type { TFunction } from "i18next";
+import type { Feature, FeatureCollection, Position } from "geojson";
+import * as maplibregl from "maplibre-gl";
+import type { MapEngine } from "@geolibre/map";
 import { useAppStore } from "@geolibre/core";
 import {
   Button,
@@ -14,10 +15,14 @@ import {
   Input,
   Label,
   ScrollArea,
+  Select,
   Separator,
 } from "@geolibre/ui";
 import {
+  Bluetooth,
+  Cable,
   Circle,
+  Crosshair,
   Download,
   LocateFixed,
   MapPin,
@@ -27,6 +32,7 @@ import {
   Save,
   Square,
   Trash2,
+  Unplug,
 } from "lucide-react";
 import {
   buildTrackGpx,
@@ -35,6 +41,7 @@ import {
   accuracyCircle,
   fixFromPosition,
   fixMeetsAccuracy,
+  formatAccuracy,
   formatDistance,
   formatDuration,
   formatSpeedKmh,
@@ -52,12 +59,28 @@ import {
   trackStats,
 } from "../../lib/gps-tracking";
 import { watchPosition } from "../../lib/geolocation";
+import type { NmeaStreamStats } from "../../lib/nmea";
+import {
+  bluetoothNmeaSupported,
+  connectBluetoothNmea,
+  connectSerialNmea,
+  DEFAULT_NMEA_BAUD_RATE,
+  NMEA_BAUD_RATES,
+  NmeaError,
+  serialNmeaSupported,
+  type NmeaConnection,
+} from "../../lib/nmea-source";
 import { saveTextFileWithFallback } from "../../lib/tauri-io";
+import { createGpsOverlay, type GpsOverlay } from "../../lib/gps-overlay";
+import { engineMarkerMap } from "../../lib/engine-style-map";
+import { createAnnotationMarker, type AnnotationMarker } from "@geolibre/plugins";
 
 interface GpsTrackingDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  mapControllerRef: React.RefObject<MapController | null>;
+  mapControllerRef: React.RefObject<MapEngine | null>;
+  /** Bumped when the map engine is (re)created, so map subscriptions re-attach. */
+  mapReadyGeneration?: number;
 }
 
 /** Transient map sources for the live position overlays (not store layers, so
@@ -70,6 +93,28 @@ const GPS_COLOR = "#2563eb";
 const TRACK_COLOR = "#ef4444";
 
 const GPS_SETTINGS_STORAGE_KEY = "geolibre.gpsTracking.settings";
+/** Remembered baud rate, so reconnecting a receiver doesn't mean re-picking it. */
+const NMEA_BAUD_STORAGE_KEY = "geolibre.gpsTracking.nmeaBaudRate";
+
+/**
+ * Where fixes come from: the device's own Geolocation API, or an external NMEA
+ * 0183 receiver on a serial port or Bluetooth (issue #1617). Both feed the same
+ * {@link GpsFix} pipeline, so tracking, recording, and export are identical.
+ */
+type PositionSource = "device" | "nmea";
+
+/** How an NMEA receiver is reached. See lib/nmea-source.ts for why both exist. */
+type NmeaTransport = "serial" | "bluetooth";
+
+function loadStoredBaudRate(): number {
+  try {
+    const raw = Number(window.localStorage.getItem(NMEA_BAUD_STORAGE_KEY));
+    if ((NMEA_BAUD_RATES as readonly number[]).includes(raw)) return raw;
+  } catch {
+    // Corrupt or unavailable storage falls through to the default.
+  }
+  return DEFAULT_NMEA_BAUD_RATE;
+}
 
 const EMPTY_FC: FeatureCollection = {
   type: "FeatureCollection",
@@ -92,6 +137,13 @@ function storeSettings(settings: GpsTrackingSettings): void {
   } catch {
     // Best-effort persistence; the session keeps the in-memory values.
   }
+}
+
+/** The track preview's line coordinates, for the overlay that draws them. */
+function neutralTrackLines(segments: GpsTrackSegments): Position[][] {
+  return trackPreview(segments).features.flatMap((feature) =>
+    feature.geometry.type === "LineString" ? [feature.geometry.coordinates] : [],
+  );
 }
 
 /** Position marker: a blue dot with a heading arrow, rotated per fix. */
@@ -182,11 +234,35 @@ function removeGpsSources(map: maplibregl.Map): void {
 type RecordingState = "off" | "recording" | "paused";
 
 /**
- * GPS Tracking (issue #1316): stream the device position onto the map with an
+ * Localized text for an {@link NmeaError}. Only the cases the UI can describe
+ * better than the browser are translated; a `failed` error carries a message
+ * relayed from the platform (a `DOMException` string, or a driver error), and
+ * showing that is more useful than a generic localized sentence.
+ */
+function nmeaErrorText(err: NmeaError, t: TFunction): string {
+  switch (err.code) {
+    case "unavailable":
+      return t("gps.nmeaUnsupported");
+    case "unsupported-device":
+      return t("gps.nmeaUnsupportedDevice");
+    case "disconnected":
+      return t("gps.nmeaDisconnected");
+    default:
+      return err.message;
+  }
+}
+
+/**
+ * GPS Tracking (issue #1316): stream a live position onto the map with an
  * accuracy circle and heading marker, optionally keep the map centered, record
  * a timestamped track log with distance/duration stats and min-distance /
  * min-time / accuracy filters, save the track as a layer or export it as
  * GPX/GeoJSON, and capture point features at the current position.
+ *
+ * Positions come from either the device's own Geolocation API or an external
+ * NMEA 0183 receiver on a serial port or Bluetooth (issue #1617). Both produce
+ * {@link GpsFix} records, so everything downstream of {@link handleFix} — the
+ * marker, the track log, the exports — is identical either way.
  *
  * The live overlays are transient map sources — only saved tracks and captured
  * points become store layers, so per-fix updates never touch undo history.
@@ -195,6 +271,7 @@ export function GpsTrackingDialog({
   open,
   onOpenChange,
   mapControllerRef,
+  mapReadyGeneration = 0,
 }: GpsTrackingDialogProps) {
   const { t } = useTranslation();
   const addGeoJsonLayer = useAppStore((s) => s.addGeoJsonLayer);
@@ -211,8 +288,33 @@ export function GpsTrackingDialog({
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const [source, setSource] = useState<PositionSource>("device");
+  const [baudRate, setBaudRate] = useState<number>(loadStoredBaudRate);
+  /** Non-null exactly while an NMEA receiver is connected; holds its label. */
+  const [nmeaLabel, setNmeaLabel] = useState<string | null>(null);
+  const [nmeaStats, setNmeaStats] = useState<NmeaStreamStats | null>(null);
+  const [connecting, setConnecting] = useState<NmeaTransport | null>(null);
+  const nmeaConnRef = useRef<NmeaConnection | null>(null);
+  /**
+   * Bumped whenever an in-flight connect is superseded — by another connect, a
+   * source change, stopping, or unmount. A Bluetooth `gatt.connect()` can stay
+   * pending for seconds, and nothing stops the user abandoning it meanwhile, so
+   * a late success must close itself rather than silently reactivating a
+   * session the user believes is over (or leaking a port opened after unmount).
+   */
+  const connectGenerationRef = useRef(0);
+
   const markerRef = useRef<maplibregl.Marker | null>(null);
   const markerArrowRef = useRef<HTMLDivElement | null>(null);
+  // Every other renderer: a projected DOM marker and an SVG overlay over the
+  // engine's render surface (#2477). `neutralMarkerRoot` is what rotates with
+  // the heading, inside the element the marker positions.
+  const neutralMarkerRef = useRef<AnnotationMarker | null>(null);
+  const neutralMarkerRoot = useRef<HTMLDivElement | null>(null);
+  const neutralOverlayRef = useRef<GpsOverlay | null>(null);
+  // The engine the overlay and marker were built on; a renderer swap during a
+  // session rebuilds them on the new one.
+  const neutralEngineRef = useRef<MapEngine | null>(null);
   // Logged track fixes as pause/resume segments; a ref so the high-frequency
   // watch callback appends in place without re-creating itself, with
   // `fixCount` mirroring the total for renders. Always holds >= 1 segment.
@@ -239,6 +341,50 @@ export function GpsTrackingDialog({
 
   const getMap = useCallback(() => mapControllerRef.current?.getMap() ?? null, [mapControllerRef]);
 
+  /**
+   * Center the map on a fix. The first recenter of a session also zooms in;
+   * later ones only pan, so following doesn't fight the user's chosen zoom.
+   */
+  const recenterOnFix = useCallback(
+    (map: maplibregl.Map | null, fix: GpsFix) => {
+      if (map) {
+        map.easeTo({
+          center: [fix.lng, fix.lat],
+          duration: 500,
+          ...(zoomedRef.current ? {} : { zoom: Math.max(map.getZoom(), 15) }),
+        });
+      } else {
+        const engine = mapControllerRef.current;
+        if (!engine) return;
+        const view = engine.readView();
+        engine.easeToView({
+          ...view,
+          center: [fix.lng, fix.lat],
+          zoom: zoomedRef.current ? view.zoom : Math.max(view.zoom, 15),
+        });
+      }
+      zoomedRef.current = true;
+    },
+    [mapControllerRef],
+  );
+
+  /**
+   * Toggle follow mode. The ref moves first so a fix arriving before the
+   * re-render doesn't recenter a map the user has just panned away from, and
+   * switching it back on recenters immediately instead of leaving the map
+   * where it was until the next fix.
+   */
+  const setFollowMode = useCallback(
+    (next: boolean) => {
+      followRef.current = next;
+      setFollow(next);
+      if (!next) return;
+      const fix = lastFixRef.current;
+      if (fix) recenterOnFix(getMap(), fix);
+    },
+    [getMap, recenterOnFix],
+  );
+
   const handleFix = useCallback(
     (fix: GpsFix) => {
       lastFixRef.current = fix;
@@ -248,6 +394,7 @@ export function GpsTrackingDialog({
         lng: fix.lng,
         lat: fix.lat,
         accuracy: fix.accuracy,
+        satellites: fix.satellites,
         speed: fix.speed,
         timestamp: fix.timestamp,
       });
@@ -267,6 +414,17 @@ export function GpsTrackingDialog({
 
       const map = getMap();
       if (map) {
+        // A renderer swap from another engine leaves its overlay behind.
+        if (neutralEngineRef.current) {
+          neutralMarkerRef.current?.remove();
+          neutralMarkerRef.current = null;
+          neutralMarkerRoot.current = null;
+          neutralOverlayRef.current?.remove();
+          neutralOverlayRef.current = null;
+          neutralEngineRef.current = null;
+          // The new map's track source starts empty: draw the whole track.
+          logged = true;
+        }
         ensureGpsSources(map);
         setSourceData(map, ACCURACY_SOURCE, accuracyCircle(fix));
         // Redraw the track only when a fix was actually logged; the styledata
@@ -292,27 +450,77 @@ export function GpsTrackingDialog({
         }
         if (fix.heading != null) markerRef.current.setRotation(fix.heading);
 
-        if (followRef.current) {
-          map.easeTo({
-            center: [fix.lng, fix.lat],
-            duration: 500,
-            ...(zoomedRef.current ? {} : { zoom: Math.max(map.getZoom(), 15) }),
+        if (followRef.current) recenterOnFix(map, fix);
+      } else {
+        const engine = mapControllerRef.current;
+        if (engine?.getRenderSurface()) {
+          if (neutralEngineRef.current !== engine) {
+            // Nor may a MapLibre marker from before a swap outlive its map.
+            markerRef.current?.remove();
+            markerRef.current = null;
+            neutralMarkerRef.current?.remove();
+            neutralMarkerRef.current = null;
+            neutralOverlayRef.current?.remove();
+            neutralOverlayRef.current = null;
+            neutralEngineRef.current = engine;
+            // The rebuilt overlay starts from the whole track, not this fix.
+            logged = true;
+          }
+          neutralOverlayRef.current ??= createGpsOverlay(engine, {
+            accuracy: GPS_COLOR,
+            track: TRACK_COLOR,
           });
-          zoomedRef.current = true;
+          const overlay = neutralOverlayRef.current;
+          overlay?.setAccuracy(accuracyCircle(fix).geometry.coordinates[0]);
+          if (logged) overlay?.setTrack(neutralTrackLines(fixesRef.current));
+          if (!neutralMarkerRef.current) {
+            const host = engineMarkerMap(engine);
+            if (host) {
+              const { root, arrow } = createMarkerElement();
+              markerArrowRef.current = arrow;
+              neutralMarkerRoot.current = root;
+              const element = document.createElement("div");
+              // Above the track overlay, and transparent to the pointer so a
+              // drag that starts on it still pans the map.
+              element.style.zIndex = "5";
+              element.style.pointerEvents = "none";
+              element.append(root);
+              neutralMarkerRef.current = createAnnotationMarker(host, {
+                element,
+                anchor: "center",
+              });
+            }
+          }
+          neutralMarkerRef.current?.setLngLat([fix.lng, fix.lat]);
+          if (markerArrowRef.current)
+            markerArrowRef.current.style.display = fix.heading != null ? "block" : "none";
+          // The heading is a compass bearing; on screen it turns with the map.
+          const bearing = engine.getRenderSurface()?.getBearing() ?? 0;
+          if (neutralMarkerRoot.current)
+            neutralMarkerRoot.current.style.transform =
+              fix.heading != null ? `rotate(${fix.heading - bearing}deg)` : "";
+          if (followRef.current) recenterOnFix(null, fix);
         }
       }
     },
-    [getMap, setGpsStatus],
+    [getMap, mapControllerRef, recenterOnFix, setGpsStatus],
   );
 
-  // The watchPosition subscription follows `tracking`. On Tauri mobile this
-  // routes through the native geolocation plugin (which requests the OS location
-  // permission first); elsewhere it wraps navigator.geolocation. Starting a
-  // native watch is async, so the effect tracks cancellation and unsubscribes
-  // once the watch resolves. See lib/geolocation.ts.
+  // The first fix of every tracking session zooms in, whichever source it came
+  // from; later fixes only pan.
   useEffect(() => {
-    if (!tracking) return;
-    zoomedRef.current = false;
+    if (tracking) zoomedRef.current = false;
+  }, [tracking]);
+
+  // The watchPosition subscription follows `tracking`, and only runs for the
+  // device source — an NMEA receiver drives handleFix from its own stream
+  // instead. On Tauri mobile this routes through the native geolocation plugin
+  // (which requests the OS location permission first); elsewhere it wraps
+  // navigator.geolocation. Starting a native watch is async, so the effect
+  // tracks cancellation and unsubscribes once the watch resolves. See
+  // lib/geolocation.ts.
+  useEffect(() => {
+    if (!tracking || source !== "device") return;
     let cancelled = false;
     let unsubscribe: (() => void) | undefined;
     watchPosition(
@@ -340,7 +548,7 @@ export function GpsTrackingDialog({
       cancelled = true;
       unsubscribe?.();
     };
-  }, [tracking, handleFix, t]);
+  }, [tracking, source, handleFix, t]);
 
   // Map subscriptions while tracking. Manual panning turns follow mode off,
   // QGIS-style, so the map stays where the user dragged it instead of snapping
@@ -351,7 +559,7 @@ export function GpsTrackingDialog({
   // subscriptions for the whole session.
   useEffect(() => {
     if (!tracking) return;
-    const onDragStart = () => setFollow(false);
+    const onDragStart = () => setFollowMode(false);
     // Gated on the source actually being gone, so the frequent styledata
     // events fired by ordinary style mutations cost one getSource() check.
     const onStyleData = () => {
@@ -364,6 +572,7 @@ export function GpsTrackingDialog({
     };
     let map: maplibregl.Map | null = null;
     let timer: number | undefined;
+    let detachDrag = () => {};
     const attach = () => {
       map = getMap();
       if (map) {
@@ -371,20 +580,64 @@ export function GpsTrackingDialog({
         map.on("styledata", onStyleData);
         return;
       }
+      // Another renderer: a press that moves on the map is a drag.
+      const container = mapControllerRef.current?.getRenderSurface()?.getContainer();
+      if (container) {
+        let start: { x: number; y: number } | null = null;
+        // Only a press on the map itself, not on a control inside the same
+        // container (a zoom widget, a plugin panel's slider).
+        const canvas = mapControllerRef.current?.getRenderSurface()?.getCanvas();
+        // The canvas's own wrapper (the SDK's view surface) takes the press on
+        // some engines; the controls sit outside it.
+        const surfaceElement = canvas?.parentElement !== container ? canvas?.parentElement : null;
+        const onDown = (event: PointerEvent) => {
+          const target = event.target as Node | null;
+          const onMap =
+            target === canvas || (!!surfaceElement && !!target && surfaceElement.contains(target));
+          start = onMap ? { x: event.clientX, y: event.clientY } : null;
+        };
+        const onMove = (event: PointerEvent) => {
+          if (!start || !event.buttons) return;
+          if (Math.hypot(event.clientX - start.x, event.clientY - start.y) < 4) return;
+          start = null;
+          onDragStart();
+        };
+        const onUp = () => {
+          start = null;
+        };
+        container.addEventListener("pointerdown", onDown);
+        container.addEventListener("pointermove", onMove);
+        window.addEventListener("pointerup", onUp);
+        detachDrag = () => {
+          container.removeEventListener("pointerdown", onDown);
+          container.removeEventListener("pointermove", onMove);
+          window.removeEventListener("pointerup", onUp);
+        };
+        return;
+      }
       timer = window.setTimeout(attach, 500);
     };
     attach();
     return () => {
       if (timer !== undefined) window.clearTimeout(timer);
+      detachDrag();
       map?.off("dragstart", onDragStart);
       map?.off("styledata", onStyleData);
     };
-  }, [tracking, getMap]);
+    // `mapReadyGeneration`: a renderer swap mid-session re-attaches to the new
+    // map, as the ref alone does not re-run this effect.
+  }, [tracking, getMap, mapControllerRef, setFollowMode, mapReadyGeneration]);
 
   const clearMapArtifacts = useCallback(() => {
     markerRef.current?.remove();
     markerRef.current = null;
     markerArrowRef.current = null;
+    neutralMarkerRef.current?.remove();
+    neutralMarkerRef.current = null;
+    neutralMarkerRoot.current = null;
+    neutralOverlayRef.current?.remove();
+    neutralOverlayRef.current = null;
+    neutralEngineRef.current = null;
     const map = getMap();
     if (map) removeGpsSources(map);
   }, [getMap]);
@@ -407,6 +660,12 @@ export function GpsTrackingDialog({
     () => () => {
       clearMapArtifacts();
       useAppStore.getState().setGpsStatus(null);
+      // Release the serial port / GATT server so a re-mount can reopen it, and
+      // mark any in-flight connect stale so one that resolves after this closes
+      // itself instead of leaking a device nothing will ever release.
+      connectGenerationRef.current += 1;
+      void nmeaConnRef.current?.close();
+      nmeaConnRef.current = null;
     },
     [clearMapArtifacts],
   );
@@ -419,29 +678,176 @@ export function GpsTrackingDialog({
     });
   }, []);
 
+  /**
+   * Release the live connection and clear its readout, leaving the generation
+   * alone. Split from {@link disconnectNmea} so a connect attempt can close a
+   * previous connection without invalidating the generation it just claimed.
+   */
+  const closeNmea = useCallback(async () => {
+    const conn = nmeaConnRef.current;
+    nmeaConnRef.current = null;
+    setNmeaLabel(null);
+    setNmeaStats(null);
+    try {
+      await conn?.close();
+    } catch {
+      // A device that will not release cleanly (unplugged mid-close, GATT
+      // already gone) must not surface as an unhandled rejection from the
+      // `void disconnectNmea()` call sites. The readout is cleared regardless.
+    }
+  }, []);
+
+  /** Abandon any in-flight connect as well as closing the live connection. */
+  const disconnectNmea = useCallback(async () => {
+    connectGenerationRef.current += 1;
+    // Clearing the indicator belongs on the abandon path rather than in
+    // connectNmea's `finally`: an attempt abandoned by a source change or a
+    // stop is stale by the time it resolves, so that `finally` deliberately
+    // skips it, and the buttons would stay disabled showing "Connecting…" for
+    // the rest of the session.
+    setConnecting(null);
+    await closeNmea();
+  }, [closeNmea]);
+
+  /**
+   * Open an NMEA receiver and start tracking from it. Both transports show a
+   * browser device chooser, so this must run from a user gesture; a dismissed
+   * chooser is a deliberate "never mind" and is not surfaced as an error.
+   */
+  const connectNmea = useCallback(
+    async (transport: NmeaTransport) => {
+      setError(null);
+      setNotice(null);
+      // Claim a generation synchronously, before the first await: closing the
+      // previous connection suspends, and two invocations that both captured
+      // afterwards would read the same value and both believe they are current.
+      const generation = ++connectGenerationRef.current;
+      const isStale = () => generation !== connectGenerationRef.current;
+      // Show the indicator before the first await, so there is no window in
+      // which an attempt is in flight but the buttons look idle — closing a
+      // live connection below can take real time. closeNmea deliberately does
+      // not clear it; only the abandon path (disconnectNmea) does.
+      setConnecting(transport);
+      // Closes the previous connection without invalidating the generation
+      // just claimed, and cannot reject (closeNmea swallows close failures).
+      await closeNmea();
+      if (isStale()) return;
+      try {
+        const handlers = {
+          // Both callbacks are generation-guarded: the transport starts reading
+          // before this function commits the connection, so a superseded
+          // attempt could otherwise re-create overlays teardown had cleared, or
+          // tear down a newer connection that replaced it.
+          onFix: (fix: GpsFix) => {
+            if (!isStale()) handleFix(fix);
+          },
+          // A dropped device or a read failure stops the session rather than
+          // leaving a stale position on the map.
+          onError: (err: NmeaError) => {
+            if (isStale()) return;
+            setError(nmeaErrorText(err, t));
+            setTracking(false);
+            void disconnectNmea();
+          },
+        };
+        const conn =
+          transport === "serial"
+            ? await connectSerialNmea({ baudRate }, handlers)
+            : await connectBluetoothNmea(handlers);
+        if (isStale()) {
+          // The user moved on while the device was still opening: release it
+          // rather than resurrecting a session they already abandoned.
+          await conn.close();
+          return;
+        }
+        nmeaConnRef.current = conn;
+        setNmeaLabel(conn.label);
+        setNmeaStats(conn.stats());
+        setTracking(true);
+      } catch (err) {
+        if (isStale()) return;
+        if (err instanceof NmeaError) {
+          if (!err.cancelled) setError(nmeaErrorText(err, t));
+        } else {
+          setError(err instanceof Error ? err.message : t("gps.nmeaConnectFailed"));
+        }
+      } finally {
+        // A superseded attempt must not clear the newer attempt's indicator;
+        // one abandoned by a source change or a stop already had it reset by
+        // disconnectNmea itself.
+        if (!isStale()) setConnecting(null);
+      }
+    },
+    [baudRate, closeNmea, disconnectNmea, handleFix, t],
+  );
+
+  // Poll the assembler's counters while connected so the readout shows the
+  // stream is alive even before the first usable fix arrives.
+  useEffect(() => {
+    if (!nmeaLabel) return;
+    const id = window.setInterval(() => {
+      setNmeaStats(nmeaConnRef.current?.stats() ?? null);
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [nmeaLabel]);
+
+  const updateBaudRate = useCallback((next: number) => {
+    setBaudRate(next);
+    try {
+      window.localStorage.setItem(NMEA_BAUD_STORAGE_KEY, String(next));
+    } catch {
+      // Best-effort persistence; the session keeps the in-memory value.
+    }
+  }, []);
+
+  /** Switching source ends the current session so no stale fixes linger. */
+  const changeSource = useCallback(
+    (next: PositionSource) => {
+      if (next === source) return;
+      setSource(next);
+      setTracking(false);
+      void disconnectNmea();
+      setError(null);
+      setNotice(null);
+    },
+    [source, disconnectNmea],
+  );
+
+  /**
+   * Whether anything can actually feed {@link handleFix} right now. The device
+   * watch starts on demand, but an NMEA receiver has to be connected first —
+   * otherwise starting a recording produces a session that silently logs
+   * nothing, reports no error, and hides the "connect a receiver" hint.
+   */
+  const canTrack = source === "device" || nmeaLabel != null;
+
   const handleStart = useCallback(() => {
+    if (!canTrack) return;
     setError(null);
     setNotice(null);
     setTracking(true);
-  }, []);
+  }, [canTrack]);
 
   const handleStop = useCallback(() => {
     setTracking(false);
-  }, []);
+    void disconnectNmea();
+  }, [disconnectNmea]);
 
   const clearTrack = useCallback(() => {
     fixesRef.current = [[]];
     setFixCount(0);
     const map = getMap();
     if (map) setSourceData(map, TRACK_SOURCE, EMPTY_FC);
+    neutralOverlayRef.current?.setTrack([]);
   }, [getMap]);
 
   const handleStartRecording = useCallback(() => {
+    if (!canTrack) return;
     clearTrack();
     changeRecording("recording");
     setNotice(null);
     if (!tracking) handleStart();
-  }, [clearTrack, changeRecording, tracking, handleStart]);
+  }, [canTrack, clearTrack, changeRecording, tracking, handleStart]);
 
   const handleDiscardTrack = useCallback(() => {
     clearTrack();
@@ -450,13 +856,14 @@ export function GpsTrackingDialog({
   }, [clearTrack, changeRecording]);
 
   const handleResumeRecording = useCallback(() => {
+    if (!canTrack) return;
     // A pause/resume boundary starts a new segment, so the stretch travelled
     // while paused is never drawn or measured as if it had been walked.
     const segments = fixesRef.current;
     if (segments[segments.length - 1].length > 0) segments.push([]);
     changeRecording("recording");
     if (!tracking) handleStart();
-  }, [changeRecording, tracking, handleStart]);
+  }, [canTrack, changeRecording, tracking, handleStart]);
 
   const trackName = useCallback(() => {
     const first = fixesRef.current.flat()[0];
@@ -519,7 +926,7 @@ export function GpsTrackingDialog({
     if (!fixMeetsAccuracy(fix, settingsRef.current)) {
       setNotice(
         t("gps.captureBlocked", {
-          accuracy: Math.round(fix.accuracy),
+          accuracy: formatAccuracy(fix.accuracy, t("gps.notAvailable")),
           max: settingsRef.current.maxAccuracyM,
         }),
       );
@@ -561,6 +968,11 @@ export function GpsTrackingDialog({
           recording={recording}
           stats={stats}
           capturedCount={capturedCount}
+          follow={follow}
+          // Flip the ref, not the rendered `follow`: a drag that has just
+          // turned follow off updates the ref synchronously but the state only
+          // on the next render, so `!follow` could re-disable it instead.
+          onToggleFollow={() => setFollowMode(!followRef.current)}
           onCapture={handleCapturePoint}
           onPause={() => changeRecording("paused")}
           onResume={handleResumeRecording}
@@ -577,6 +989,31 @@ export function GpsTrackingDialog({
 
           <ScrollArea className="max-h-[65vh] pe-3">
             <div className="space-y-4 py-1">
+              {/* Position source */}
+              <div className="space-y-2">
+                <Label htmlFor="gps-source">{t("gps.source")}</Label>
+                <Select
+                  id="gps-source"
+                  value={source}
+                  onChange={(e) => changeSource(e.target.value as PositionSource)}
+                >
+                  <option value="device">{t("gps.sourceDevice")}</option>
+                  <option value="nmea">{t("gps.sourceNmea")}</option>
+                </Select>
+                {source === "nmea" && (
+                  <NmeaControls
+                    baudRate={baudRate}
+                    onBaudRateChange={updateBaudRate}
+                    connecting={connecting}
+                    connectedLabel={nmeaLabel}
+                    stats={nmeaStats}
+                    onConnect={(transport) => void connectNmea(transport)}
+                  />
+                )}
+              </div>
+
+              <Separator />
+
               {/* Live position */}
               <div className="space-y-2">
                 {tracking ? (
@@ -586,20 +1023,28 @@ export function GpsTrackingDialog({
                       <input
                         type="checkbox"
                         checked={follow}
-                        onChange={(e) => setFollow(e.target.checked)}
+                        onChange={(e) => setFollowMode(e.target.checked)}
                       />
                       {t("gps.follow")}
                     </label>
                     <Button variant="outline" className="w-full" onClick={handleStop}>
-                      <Square className="me-2 h-4 w-4" />
-                      {t("gps.stop")}
+                      {source === "nmea" ? (
+                        <Unplug className="me-2 h-4 w-4" />
+                      ) : (
+                        <Square className="me-2 h-4 w-4" />
+                      )}
+                      {source === "nmea" ? t("gps.nmeaDisconnect") : t("gps.stop")}
                     </Button>
                   </>
-                ) : (
+                ) : source === "device" ? (
                   <Button className="w-full" onClick={handleStart}>
                     <LocateFixed className="me-2 h-4 w-4" />
                     {t("gps.start")}
                   </Button>
+                ) : (
+                  <p className="rounded-md bg-muted p-2 text-sm text-muted-foreground">
+                    {t("gps.nmeaNotConnected")}
+                  </p>
                 )}
               </div>
 
@@ -617,7 +1062,7 @@ export function GpsTrackingDialog({
                 )}
                 <div className="flex flex-wrap gap-2">
                   {recording === "off" && (
-                    <Button size="sm" onClick={handleStartRecording}>
+                    <Button size="sm" disabled={!canTrack} onClick={handleStartRecording}>
                       <Circle className="me-1 h-3.5 w-3.5 fill-red-500 text-red-500" />
                       {t("gps.record")}
                     </Button>
@@ -629,7 +1074,7 @@ export function GpsTrackingDialog({
                     </Button>
                   )}
                   {recording === "paused" && (
-                    <Button size="sm" onClick={handleResumeRecording}>
+                    <Button size="sm" disabled={!canTrack} onClick={handleResumeRecording}>
                       <Play className="me-1 h-3.5 w-3.5" />
                       {t("gps.resume")}
                     </Button>
@@ -757,11 +1202,122 @@ function FixReadout({ fix }: { fix: GpsFix | null }) {
       <span>
         {fix.lng.toFixed(5)}, {fix.lat.toFixed(5)}
       </span>
-      <span>±{Math.round(fix.accuracy)} m</span>
-      {fix.altitude != null && <span>{Math.round(fix.altitude)} m ASL</span>}
-      {fix.speed != null && <span>{formatSpeedKmh(fix.speed)} km/h</span>}
-      {fix.heading != null && <span>{Math.round(fix.heading)}°</span>}
+      <span>±{formatAccuracy(fix.accuracy, t("gps.notAvailable"))}</span>
+      <span>{t("gps.satellitesValue", { value: fix.satellites ?? t("gps.notAvailable") })}</span>
+      {/* Not "ASL": GpsFix.altitude is height above the WGS84 ellipsoid, both
+          from the Geolocation API and from NMEA (GGA's MSL altitude plus its
+          geoid separation), which differs from sea level by tens of meters. */}
+      {fix.altitude != null && (
+        <span>{t("gps.altitudeValue", { value: Math.round(fix.altitude) })}</span>
+      )}
+      {fix.speed != null && (
+        <span>{t("gps.speedValue", { value: formatSpeedKmh(fix.speed) })}</span>
+      )}
+      {fix.heading != null && (
+        <span>{t("gps.headingValue", { value: Math.round(fix.heading) })}</span>
+      )}
       <span className="text-muted-foreground">{new Date(fix.timestamp).toLocaleTimeString()}</span>
+    </div>
+  );
+}
+
+interface NmeaControlsProps {
+  baudRate: number;
+  onBaudRateChange: (value: number) => void;
+  connecting: NmeaTransport | null;
+  /** Device label while connected, null when not. */
+  connectedLabel: string | null;
+  stats: NmeaStreamStats | null;
+  onConnect: (transport: NmeaTransport) => void;
+}
+
+/**
+ * Connect controls for an external NMEA 0183 receiver (issue #1617).
+ *
+ * Serial is listed first and Bluetooth second on purpose: most Bluetooth GNSS
+ * pucks speak classic Bluetooth (Serial Port Profile), which Web Bluetooth
+ * cannot reach at all — they are paired in the OS and opened here as a virtual
+ * serial port. The Bluetooth button is for Bluetooth Low Energy receivers only,
+ * which the hint below spells out.
+ */
+function NmeaControls({
+  baudRate,
+  onBaudRateChange,
+  connecting,
+  connectedLabel,
+  stats,
+  onConnect,
+}: NmeaControlsProps) {
+  const { t } = useTranslation();
+  const serialOk = serialNmeaSupported();
+  const bluetoothOk = bluetoothNmeaSupported();
+
+  if (connectedLabel) {
+    return (
+      <div className="space-y-1 rounded-md bg-muted p-2 text-sm">
+        <p>{t("gps.nmeaConnected", { device: connectedLabel })}</p>
+        {stats && (
+          <p className="text-xs text-muted-foreground tabular-nums">
+            {stats.fixes > 0 || stats.parsed > 0
+              ? t("gps.nmeaStats", { parsed: stats.parsed, fixes: stats.fixes })
+              : t("gps.nmeaWaiting")}
+            {stats.fixQuality ? ` · ${t(`gps.fixQuality.${stats.fixQuality}`)}` : ""}
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  if (!serialOk && !bluetoothOk) {
+    return <p className="text-xs text-muted-foreground">{t("gps.nmeaUnsupported")}</p>;
+  }
+
+  return (
+    <div className="space-y-2">
+      {serialOk && (
+        <div className="space-y-1">
+          <Label htmlFor="gps-nmea-baud" className="text-xs font-normal text-muted-foreground">
+            {t("gps.nmeaBaudRate")}
+          </Label>
+          <Select
+            id="gps-nmea-baud"
+            value={baudRate}
+            onChange={(e) => onBaudRateChange(Number(e.target.value))}
+          >
+            {NMEA_BAUD_RATES.map((rate) => (
+              <option key={rate} value={rate}>
+                {rate}
+              </option>
+            ))}
+          </Select>
+        </div>
+      )}
+      <div className="flex flex-wrap gap-2">
+        <Button
+          size="sm"
+          disabled={!serialOk || connecting !== null}
+          onClick={() => onConnect("serial")}
+        >
+          <Cable className="me-1 h-3.5 w-3.5" />
+          {connecting === "serial" ? t("gps.nmeaConnecting") : t("gps.nmeaConnectSerial")}
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={!bluetoothOk || connecting !== null}
+          onClick={() => onConnect("bluetooth")}
+        >
+          <Bluetooth className="me-1 h-3.5 w-3.5" />
+          {connecting === "bluetooth" ? t("gps.nmeaConnecting") : t("gps.nmeaConnectBluetooth")}
+        </Button>
+      </div>
+      <p className="text-xs text-muted-foreground">{t("gps.nmeaBluetoothHint")}</p>
+      {!serialOk && (
+        <p className="text-xs text-muted-foreground">{t("gps.nmeaSerialUnsupported")}</p>
+      )}
+      {!bluetoothOk && (
+        <p className="text-xs text-muted-foreground">{t("gps.nmeaBluetoothUnsupported")}</p>
+      )}
     </div>
   );
 }
@@ -798,6 +1354,8 @@ interface FloatingPanelProps {
   recording: RecordingState;
   stats: { distanceM: number; durationS: number; pointCount: number };
   capturedCount: number;
+  follow: boolean;
+  onToggleFollow: () => void;
   onCapture: () => void;
   onPause: () => void;
   onResume: () => void;
@@ -808,12 +1366,19 @@ interface FloatingPanelProps {
  * Compact live readout shown while GPS is on and the dialog is closed, so the
  * map stays fully visible in the field. Anchored to the trailing corner to
  * avoid the Field Collection quick-open button at bottom center.
+ *
+ * Carries its own follow toggle: panning the map turns follow off (QGIS-style),
+ * and in the field the dialog is usually closed, so without it the only way
+ * back is to reopen the dialog — which reads as "keep map centered does
+ * nothing".
  */
 function FloatingPanel({
   fix,
   recording,
   stats,
   capturedCount,
+  follow,
+  onToggleFollow,
   onCapture,
   onPause,
   onResume,
@@ -826,12 +1391,30 @@ function FloatingPanel({
         <LocateFixed className="h-4 w-4 shrink-0 text-primary" />
         {fix ? (
           <span>
-            {fix.lng.toFixed(5)}, {fix.lat.toFixed(5)} ±{Math.round(fix.accuracy)} m
+            {fix.lng.toFixed(5)}, {fix.lat.toFixed(5)} ±
+            {formatAccuracy(fix.accuracy, t("gps.notAvailable"))}
+            {" · "}
+            {t("gps.satellitesShortValue", {
+              value: fix.satellites ?? t("gps.notAvailable"),
+            })}
           </span>
         ) : (
           <span className="text-muted-foreground">{t("gps.waitingForFix")}</span>
         )}
       </div>
+      {/* Speed and heading over ground, the readout an external NMEA receiver
+          makes meaningful (issue #1617). Hidden until the fix reports them, so
+          a stationary device shows nothing rather than a row of dashes. */}
+      {fix && (fix.speed != null || fix.heading != null) && (
+        <div className="flex items-center gap-3 text-xs text-muted-foreground tabular-nums">
+          {fix.speed != null && (
+            <span>{t("gps.speedValue", { value: formatSpeedKmh(fix.speed) })}</span>
+          )}
+          {fix.heading != null && (
+            <span>{t("gps.headingValue", { value: Math.round(fix.heading) })}</span>
+          )}
+        </div>
+      )}
       {recording !== "off" && (
         <div className="flex items-center gap-3 text-xs text-muted-foreground tabular-nums">
           {recording === "recording" && (
@@ -846,6 +1429,15 @@ function FloatingPanel({
         <Button size="sm" variant="outline" disabled={!fix} onClick={onCapture}>
           <MapPin className="me-1 h-3.5 w-3.5" />
           {t("gps.capturePoint")}
+        </Button>
+        <Button
+          size="sm"
+          variant={follow ? "default" : "outline"}
+          aria-label={t("gps.follow")}
+          aria-pressed={follow}
+          onClick={onToggleFollow}
+        >
+          <Crosshair className="h-3.5 w-3.5" />
         </Button>
         {recording === "recording" && (
           <Button size="sm" variant="outline" aria-label={t("gps.pause")} onClick={onPause}>

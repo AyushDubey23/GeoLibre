@@ -1,7 +1,7 @@
 import { useAppStore } from "@geolibre/core";
 import type { GeoLibreLayer } from "@geolibre/core";
-import type { MapController } from "@geolibre/map";
-import { addCogRasterLayer } from "@geolibre/plugins";
+import type { MapEngine } from "@geolibre/map";
+import { addRasterToMap } from "@geolibre/plugins";
 import {
   RASTER_TOOLS,
   getRasterTool,
@@ -10,6 +10,8 @@ import {
   runRasterTool,
   readRasterData,
   runRasterToolClient,
+  convertRasterDataToCog,
+  exceedsBrowserCogConversionLimit,
   buildSpectralIndexExpression,
   type AlgorithmParameter,
   type ConversionJob,
@@ -56,6 +58,7 @@ import {
   pickSavePathWithFallback,
   saveBinaryFileWithFallback,
 } from "../../lib/tauri-io";
+import { IS_MAS_BUILD } from "../../lib/build-flags";
 import { startGeoLibreSidecar } from "../../lib/sidecar";
 import {
   beginProcessingRun,
@@ -65,6 +68,12 @@ import {
 import { createAppAPI } from "../../hooks/usePlugins";
 import { canExportRasterLayer, rasterExportUrl } from "../../lib/raster-export";
 import { fetchableUrl } from "../../lib/url-utils";
+import {
+  translateParameter,
+  translateToolDescription,
+  translateToolGroup,
+  translateToolName,
+} from "../../lib/processing-tool-i18n";
 
 /**
  * The input URL the Python sidecar can read for an added raster layer, or null
@@ -110,7 +119,7 @@ function toolDefaults(tool: RasterTool): Record<string, unknown> {
 }
 
 interface RasterToolsDialogProps {
-  mapControllerRef: RefObject<MapController | null>;
+  mapControllerRef: RefObject<MapEngine | null>;
 }
 
 export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps): ReactElement {
@@ -123,6 +132,10 @@ export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps):
 
   const open = openTool !== null;
   const desktop = isTauri();
+  // Whether this build can run the sidecar engine: desktop, except the Mac App
+  // Store build, whose App Sandbox forbids the sidecar process. The client
+  // (in-browser) engine keeps working either way.
+  const desktopServer = desktop && !IS_MAS_BUILD;
   const [selectedId, setSelectedId] = useState<string>(openTool ?? RASTER_TOOLS[0].id);
   const [inputPath, setInputPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
@@ -147,7 +160,7 @@ export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps):
 
   // Client-engine state. The browser fallback reads a GeoTIFF into memory,
   // computes a new raster, adds it to the map, and offers a download.
-  const [engine, setEngine] = useState<RasterEngine>(desktop ? "sidecar" : "client");
+  const [engine, setEngine] = useState<RasterEngine>(desktopServer ? "sidecar" : "client");
   const [clientInput, setClientInput] = useState<{
     name: string;
     bytes: ArrayBuffer;
@@ -170,11 +183,14 @@ export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps):
   }, [openTool]);
 
   const checkRuntime = useCallback(async () => {
-    if (!desktop) {
-      // Raster tools are sidecar-only and the file pickers cannot resolve real
-      // paths in a browser, so a pure web build cannot run them.
+    if (!desktopServer) {
+      // Raster tools' sidecar engine cannot run in a pure web build (no real
+      // file paths) or in the Mac App Store build (no sidecar process); only
+      // the client engine works there.
       setRuntimeAvailable(false);
-      setRuntimeMessage("Raster tools need the GeoLibre desktop app with a running sidecar.");
+      setRuntimeMessage(
+        IS_MAS_BUILD ? t("masBuild.unavailable") : t("toolbar.rasterTool.needsDesktopSidecar"),
+      );
       return;
     }
     setRuntimeAvailable(null);
@@ -187,7 +203,7 @@ export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps):
       setRuntimeAvailable(false);
       setRuntimeMessage(err instanceof Error ? err.message : t("toolbar.rasterTool.errorConnect"));
     }
-  }, [desktop]);
+  }, [desktopServer, t]);
 
   // Reset per-tool state whenever the dialog opens or the selected tool changes.
   // Also reset the engine here (not only on tool change) so reopening the dialog
@@ -203,8 +219,8 @@ export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps):
     setClientInput(null);
     setClientLog([]);
     setClientResult(null);
-    setEngine(tool.supportsClient && !desktop ? "client" : "sidecar");
-  }, [open, tool, desktop]);
+    setEngine(tool.supportsClient && !desktopServer ? "client" : "sidecar");
+  }, [open, tool, desktopServer]);
 
   // Pre-fill from a pending History re-run once the requested tool is selected.
   // Declared after the reset effect above so the recorded parameters win over
@@ -553,16 +569,29 @@ export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps):
       // Persist the result before the map add so the Download button survives a
       // render failure (the compute already succeeded — don't discard it).
       setClientResult({ name: outName, bytes });
+      const resultSampleCount = result.width * result.height * result.bands.length;
+      if (exceedsBrowserCogConversionLimit(resultSampleCount)) {
+        const message = t("raster.cogConvertTooLarge", { name: outName });
+        setError(message);
+        setClientLog((prev) => [...prev, message]);
+        tracker.finish("error", message);
+        return;
+      }
       const app = createAppAPI(mapControllerRef);
       try {
-        await addCogRasterLayer(app, {
-          url: outName,
-          data: bytes,
-          name: outName.replace(/\.tiff?$/i, ""),
-          // The renderer reads NoData from options (not the file's tag), so pass
-          // it explicitly for correct transparency of masked/edge cells.
-          ...(result.nodata != null ? { nodata: result.nodata } : {}),
-        });
+        // Encode the computed Float32 samples directly. Passing the temporary
+        // geotiff.js file through the WASM reader can reinterpret its byte
+        // order and corrupt otherwise-correct calculated values.
+        const cogBytes = await convertRasterDataToCog(result);
+        await addRasterToMap(
+          app,
+          // TypeScript widens wasm byte buffers to ArrayBufferLike, which is
+          // not directly assignable to BlobPart's ArrayBufferView.
+          new File([cogBytes as Uint8Array<ArrayBuffer>], outName, { type: "image/tiff" }),
+          {
+            name: outName.replace(/\.tiff?$/i, ""),
+          },
+        );
         setClientLog((prev) => [...prev, t("toolbar.rasterTool.addedToMap", { name: outName })]);
         tracker.addOutputLayer(outName);
       } catch (mapError) {
@@ -635,7 +664,7 @@ export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps):
               {groups.map((group) => (
                 <div key={group.group} className="mb-1">
                   <div className="px-2 py-1 text-xs font-medium text-muted-foreground">
-                    {group.group}
+                    {translateToolGroup(t, group.group)}
                   </div>
                   {group.tools.map((entry) => (
                     <button
@@ -647,7 +676,7 @@ export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps):
                         entry.id === selectedId && "bg-accent font-medium text-accent-foreground",
                       )}
                     >
-                      {entry.name}
+                      {translateToolName(t, "raster", entry)}
                     </button>
                   ))}
                 </div>
@@ -657,7 +686,9 @@ export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps):
 
           {/* Parameter form + run + log */}
           <div className="flex min-w-0 flex-1 flex-col gap-3">
-            <p className="text-sm text-muted-foreground">{tool.description}</p>
+            <p className="text-sm text-muted-foreground">
+              {translateToolDescription(t, "raster", tool)}
+            </p>
 
             {/* Engine selector (only for tools with a browser implementation). */}
             {tool.supportsClient && (
@@ -667,9 +698,13 @@ export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps):
                 </Label>
                 <Select value={engine} onChange={(e) => setEngine(e.target.value as RasterEngine)}>
                   <option value="client">{t("toolbar.rasterTool.engineClient")}</option>
-                  <option value="sidecar" disabled={!desktop}>
-                    {t("toolbar.rasterTool.engineSidecar")}
-                  </option>
+                  {/* The Mac App Store build has no sidecar at all, so the
+                      option is dropped rather than shown disabled. */}
+                  {!IS_MAS_BUILD && (
+                    <option value="sidecar" disabled={!desktop}>
+                      {t("toolbar.rasterTool.engineSidecar")}
+                    </option>
+                  )}
                 </Select>
                 {engine === "client" && (
                   <p className="text-xs text-muted-foreground">
@@ -685,7 +720,7 @@ export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps):
                   <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
                   {runtimeMessage}
                 </p>
-                {desktop && (
+                {desktopServer && (
                   <Button
                     type="button"
                     variant="outline"
@@ -814,7 +849,7 @@ export function RasterToolsDialog({ mapControllerRef }: RasterToolsDialogProps):
             {tool.parameters.filter(isParamVisible).map((param) => (
               <RasterParameterField
                 key={param.id}
-                param={param}
+                param={translateParameter(t, "raster", tool.id, param)}
                 value={params[param.id]}
                 onChange={(value) => setParam(param.id, value)}
                 onPick={() => void pickPathParam(param)}

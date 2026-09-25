@@ -6,10 +6,12 @@ import { GeoTiffReader } from "geolibre-wasm";
 import {
   COG_WASM_COMPRESSIONS,
   convertGeoTiffToCog,
+  convertRasterDataToCog,
   initCogWasm,
   isTiledGeoTiff,
   readGeoTiffInfo,
 } from "../packages/processing/src/cog-convert";
+import { ensureWhiteboxRasterCog } from "../packages/processing/src/wasm-client";
 
 // A tiny 32x32 Int16 GeoTIFF written striped (not tiled) by rasterio, the kind
 // of file desktop GIS tools export and that the raster panel cannot render
@@ -69,6 +71,48 @@ describe("convertGeoTiffToCog", () => {
     }
   });
 
+  it("encodes in-memory Float32 processing results without corrupting sample bytes", async () => {
+    const expected = Float32Array.from([0, 250.25, 282.2, 322.89]);
+    const cog = await convertRasterDataToCog({
+      bands: [expected],
+      width: 4,
+      height: 1,
+      originX: 2.8,
+      originY: 47.35,
+      resX: 0.001,
+      resY: 0.001,
+      nodata: -99999,
+      geoKeys: { GTModelTypeGeoKey: 2, GeographicTypeGeoKey: 4326 },
+    });
+    const reader = new GeoTiffReader(cog);
+    try {
+      assert.deepEqual(Array.from(reader.read_band_f32(0)), Array.from(expected));
+      assert.equal(reader.epsg, 4326);
+      assert.deepEqual(Array.from(reader.geo_transform()), [2.8, 0.001, 0, 47.35, 0, -0.001]);
+    } finally {
+      reader.free();
+    }
+  });
+
+  for (const crsCode of [32767, 32768, 65535]) {
+    it(`rejects user-defined or private CRS code ${crsCode}`, async () => {
+      await assert.rejects(
+        convertRasterDataToCog({
+          bands: [Float32Array.from([1])],
+          width: 1,
+          height: 1,
+          originX: 0,
+          originY: 1,
+          resX: 1,
+          resY: 1,
+          nodata: null,
+          geoKeys: { GTModelTypeGeoKey: 1, ProjectedCSTypeGeoKey: crsCode },
+        }),
+        new RegExp(`cannot preserve user-defined or private CRS code ${crsCode}`),
+      );
+    });
+  }
+
   // Raster to COG lets the user pick a codec on the web, so every advertised
   // choice has to survive an Int16 source — webp/jpeg/jpegxl do not (they reject
   // anything but 8-bit samples) and zstd/raw are not implemented at all, which
@@ -100,5 +144,16 @@ describe("convertGeoTiffToCog", () => {
       deflate.byteLength < none.byteLength,
       `deflate (${deflate.byteLength}) should be smaller than none (${none.byteLength})`,
     );
+  });
+
+  it("normalizes every Whitebox WASM output because tiling alone does not prove COG conformance", async () => {
+    assert.equal(await isTiledGeoTiff(stripedTiff), false);
+    const converted = await ensureWhiteboxRasterCog(stripedTiff);
+
+    assert.equal(await isTiledGeoTiff(converted), true);
+    assert.notEqual(converted, stripedTiff);
+    const revalidated = await ensureWhiteboxRasterCog(converted);
+    assert.equal(await isTiledGeoTiff(revalidated), true);
+    assert.notEqual(revalidated, converted);
   });
 });

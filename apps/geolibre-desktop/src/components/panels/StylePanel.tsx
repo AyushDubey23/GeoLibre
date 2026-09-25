@@ -1,6 +1,14 @@
 import {
+  BLEND_MODES,
+  DEFAULT_BLEND_MODE,
   DEFAULT_LAYER_STYLE,
+  LABEL_NUMBER_LOCALES,
+  controlRendersLayer,
+  formatLabelNumberSample,
+  isInitialLayerStyle,
+  type BlendMode,
   type DiagramField,
+  type GeoLibreLayer,
   type DiagramSizeMode,
   type DiagramType,
   type ExpressionVariable,
@@ -18,6 +26,8 @@ import {
   type VectorStyleStop,
   collectDiagramData,
   geojsonHasZCoordinates,
+  isCzmlLayer,
+  isCesiumKmlLayer,
   isStyleLibraryTargetLayer,
   parseJsonExpression,
   pluginOwnsPaint,
@@ -48,18 +58,39 @@ import {
   countAtlasDroppedDiagrams,
   getVectorLayerPropertyValues,
 } from "@geolibre/plugins";
-import { type MapController } from "@geolibre/map";
+import {
+  arcgisVectorStyle,
+  layerBlendModesSupported,
+  mapboxUnsupportedStyleSettings,
+  arcgisRasterEffect,
+  arcgisUnsupportedStyleSettings,
+  subscribeLayerBlendModeSupport,
+  type MapEngine,
+} from "@geolibre/map";
 import type { ParseKeys, TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { AttributeFormSection } from "./AttributeFormSection";
+import { PopupSection } from "./PopupSection";
+import { EditorTrackingSection } from "./EditorTrackingSection";
 import { LayerJoinsSection } from "./LayerJoinsSection";
+import { QuickFiltersSection } from "./QuickFiltersSection";
 import { VirtualFieldsSection } from "./VirtualFieldsSection";
+import { getNetcdfLayerState, NETCDF_IMAGE_SOURCE_KIND } from "../../lib/netcdf-image-symbology";
+import { PasteStyleDialog } from "./PasteStyleDialog";
+import {
+  IMPORTED_STYLE_NOTE_DURATION_MS,
+  importedStyleNote,
+  type ImportedStyleNote,
+} from "../../lib/style-import-note";
+import { NetcdfProfilePanel } from "./NetcdfProfilePanel";
+import { NetcdfSymbologySection } from "./NetcdfSymbologySection";
 import { RasterSymbologySection } from "./RasterSymbologySection";
 import { TimeSliderSymbologySection } from "./TimeSliderSymbologySection";
 import { ExpressionBuilderDialog } from "../expressions/ExpressionBuilderDialog";
 import {
   ChevronDown,
   ChevronUp,
+  ClipboardType,
   CornerDownRight,
   Info,
   Palette,
@@ -67,8 +98,10 @@ import {
   PanelRightOpen,
   Plus,
   SlidersHorizontal,
+  Sparkles,
   SquareFunction,
   Trash2,
+  X,
 } from "lucide-react";
 import {
   type PointerEvent as ReactPointerEvent,
@@ -78,21 +111,27 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
-import { getIsMobileViewport } from "../../hooks/useIsMobileViewport";
-import { loadedVectorTileFeatures } from "../../hooks/useVectorTileGeometryBackfill";
+import { loadedVectorTileFeatures, vectorTileMap } from "../../hooks/useVectorTileGeometryBackfill";
 import { clamp } from "../../lib/clamp";
 import {
   getAttributePropertyNames,
   standardExpressionVariables,
 } from "../../lib/expression-inputs";
 import {
+  chooseGraduatedProperty,
   clampClassCount,
   createCategorizedStops,
   createGraduatedStops,
+  countCategorizedValues,
   getPropertyValues,
-  numericBounds,
+  isCategoricalProperty,
+  isNumericProperty,
+  MAX_MANUAL_CATEGORIZED_VALUES,
+  proportionalSizeBounds,
 } from "../../lib/vector-style-classification";
+import { buildStyleSuggestions, type StyleSuggestion } from "../../lib/style-suggestions";
 
 /**
  * Data-defined label overrides (GH #1320): one row per {@link LabelStyle}
@@ -159,8 +198,12 @@ function labelOverrideInvalid(
 }
 
 interface StylePanelProps {
-  mapControllerRef: RefObject<MapController | null>;
+  mapControllerRef: RefObject<MapEngine | null>;
+  /** Bumped when the map (re)initializes; see {@link useQuickFilterProfiles}. */
+  mapReadyGeneration?: number;
   onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  /** Incremented when another part of the UI explicitly requests this panel. */
+  openRequest?: number;
   /**
    * When this flips to `true` the panel collapses to its thin rail (it is not
    * unmounted). Used to clear room when the notebook opens beside the map; the
@@ -270,6 +313,25 @@ function isPointOnlyGeoJsonLayer(layer: {
     const type = feature.geometry?.type;
     return type === "Point" || type === "MultiPoint";
   });
+}
+
+/**
+ * True when the heatmap and cluster renderers apply to a layer: a point-only
+ * core GeoJSON layer, or a point layer painted by the maplibre-gl-vector
+ * control. Shared by the panel's own gating and the style-suggestion memo, so
+ * the two cannot disagree about where a heatmap is offerable.
+ *
+ * @param pointOnly - Result of {@link isPointOnlyGeoJsonLayer}, passed in so
+ *   the caller can reuse its memoized value instead of re-scanning features.
+ */
+function supportsPointRendererFor(layer: GeoLibreLayer, pointOnly: boolean): boolean {
+  if (hasExternalDeckLayer(layer)) return false;
+  if (!hasExternalNativeLayers(layer)) return pointOnly;
+  return (
+    layer.type === "geojson" &&
+    layer.metadata.sourceKind === "maplibre-gl-vector" &&
+    layer.metadata.geometryType === "point"
+  );
 }
 
 interface GeometryFlags {
@@ -552,8 +614,39 @@ function createDefaultStops(
   return styleValue(DEFAULT_LAYER_STYLE, "vectorStyleStops");
 }
 
+/**
+ * Count the distinct values a property offers as categorized stops, or 0 when
+ * that count is not known to be complete.
+ *
+ * A tiled source only exposes the features MapLibre has currently rendered, so
+ * its distinct values are a viewport sample that changes as the map pans. Add
+ * Vector Layer datasets are the exception: they render as tiles but their
+ * values come back complete from DuckDB, which is why the property-value
+ * loading effect keys on `metadata.sourceKind === "maplibre-gl-vector"` rather
+ * than on `layer.type`. Counts past the manual ceiling also report 0, so the
+ * panel never offers to render more category rows than it can.
+ */
+function completeCategorizedValueCount(
+  layer: GeoLibreLayer | undefined,
+  property: string,
+  loadedValues: unknown[] | undefined,
+): number {
+  if (!layer || !property) return 0;
+  const valuesAreSampled =
+    !layer.geojson &&
+    layer.metadata.sourceKind !== "maplibre-gl-vector" &&
+    (layer.type === "vector-tiles" || layer.type === "pmtiles" || layer.type === "mbtiles");
+  if (valuesAreSampled) return 0;
+  const count = countCategorizedValues(loadedValues ?? getPropertyValues(layer, property));
+  return count <= MAX_MANUAL_CATEGORIZED_VALUES ? count : 0;
+}
+
 function normalizeVectorStyleClassCount(mode: VectorStyleMode, value: number): number {
-  return clampClassCount(value, mode === "categorized" ? 1 : 2);
+  return clampClassCount(
+    value,
+    mode === "categorized" ? 1 : 2,
+    mode === "categorized" ? MAX_MANUAL_CATEGORIZED_VALUES : 12,
+  );
 }
 
 function defaultClassificationScheme(mode: VectorStyleMode): string {
@@ -593,49 +686,6 @@ function chooseDefaultStyleProperty(
   }
 
   return currentProperty;
-}
-
-function isNumericProperty(
-  layer: Parameters<typeof getPropertyValues>[0],
-  property: string,
-): boolean {
-  const values = getPropertyValues(layer, property);
-  const numericValues = values.map((value) => Number(value)).filter(Number.isFinite);
-  return numericValues.length > 1;
-}
-
-function chooseGraduatedProperty(
-  layer: Parameters<typeof getPropertyValues>[0],
-  properties: string[],
-): string {
-  let bestProperty = "";
-  let bestScore = -1;
-
-  for (const property of properties) {
-    const values = getPropertyValues(layer, property)
-      .map((value) => Number(value))
-      .filter(Number.isFinite);
-    if (values.length < 2) continue;
-
-    const { min, max } = numericBounds(values);
-    const range = max - min;
-    const score = new Set(values).size * Math.log10(Math.max(1, range) + 1);
-    if (score > bestScore) {
-      bestProperty = property;
-      bestScore = score;
-    }
-  }
-
-  return bestProperty;
-}
-
-function isCategoricalProperty(
-  layer: Parameters<typeof getPropertyValues>[0],
-  property: string,
-): boolean {
-  const values = getPropertyValues(layer, property).map((value) => String(value));
-  const uniqueCount = new Set(values).size;
-  return uniqueCount > 1 && uniqueCount <= 12;
 }
 
 function normalizeVectorStyleStops(
@@ -690,9 +740,11 @@ function validateExpressionJson(value: string, label: string, t: TFunction): str
 }
 
 // Shared shell classes for every expanded StylePanel return branch. On phones
-// (max-md) it overlays the map as a bottom sheet instead of squeezing it.
+// (max-md) it overlays the map as a bottom sheet instead of squeezing it. The
+// sheet needs a definite height so the Radix ScrollArea viewport can resolve
+// its percentage height and scroll instead of growing to the content height.
 const STYLE_PANEL_ASIDE_CLASS =
-  "relative flex max-h-[min(24rem,42vh)] supports-[max-height:1dvh]:max-h-[min(24rem,42dvh)] w-full shrink-0 flex-col border-t bg-card max-md:absolute max-md:inset-x-0 max-md:bottom-0 max-md:z-30 max-md:shadow-xl md:max-h-none md:w-[var(--style-panel-width)] md:border-s md:border-t-0";
+  "relative flex h-[min(24rem,42vh)] supports-[height:1dvh]:h-[min(24rem,42dvh)] w-full shrink-0 flex-col border-t bg-card max-md:absolute max-md:inset-x-0 max-md:bottom-0 max-md:z-30 max-md:shadow-xl md:h-auto md:w-[var(--style-panel-width)] md:border-s md:border-t-0";
 
 const MIN_LAYER_ZOOM = DEFAULT_LAYER_STYLE.minZoom;
 const MAX_LAYER_ZOOM = DEFAULT_LAYER_STYLE.maxZoom;
@@ -964,22 +1016,40 @@ function RasterStyleSlider({
 
 export function StylePanel({
   mapControllerRef,
+  mapReadyGeneration,
   onResizeStart,
+  openRequest = 0,
   autoCollapse = false,
   collapsed: controlledCollapsed,
   onCollapsedChange,
   hideOwnRail = false,
 }: StylePanelProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const selectedLayerId = useAppStore((s) => s.selectedLayerId);
   const layers = useAppStore((s) => s.layers);
   const setLayerOpacity = useAppStore((s) => s.setLayerOpacity);
   const setLayerStyle = useAppStore((s) => s.setLayerStyle);
   const setStyleManagerOpen = useAppStore((s) => s.setStyleManagerOpen);
+  // The Mapbox compiler draws only part of the symbology below; see
+  // `mapboxUnsupportedStyleSettings`.
+  const mapboxPrimary = useAppStore((s) => s.primaryRenderer === "mapbox");
+  // Likewise for ArcGIS, whose 3D SceneView (the globe, or any view with
+  // terrain) draws a different subset from its flat MapView.
+  const arcgisPrimary = useAppStore((s) => s.primaryRenderer === "arcgis");
+  const arcgisScene = useAppStore(
+    (s) => s.preferences.map.projection === "globe" || s.preferences.map.terrainEnabled,
+  );
+  const [pasteStyleOpen, setPasteStyleOpen] = useState(false);
+  // What the last pasted style reported. The Layers panel has a per-row note for this; this
+  // panel has none, and dropping the parser's warnings would make an import that could not be
+  // fully represented look like a clean one.
+  const [pasteStyleNotice, setPasteStyleNotice] = useState<ImportedStyleNote | null>(null);
   const updateLayer = useAppStore((s) => s.updateLayer);
   const moveLayer = useAppStore((s) => s.moveLayer);
   const projectName = useAppStore((s) => s.projectName);
-  const [internalCollapsed, setInternalCollapsed] = useState(getIsMobileViewport);
+  // Style starts on its rail on every platform and remains there until the
+  // user explicitly expands it.
+  const [internalCollapsed, setInternalCollapsed] = useState(true);
   // In the shared right-sidebar mode the parent owns collapse (controlled);
   // otherwise the panel manages it locally. `setIsCollapsed` routes to whichever
   // owner applies so every existing call site keeps working.
@@ -992,6 +1062,19 @@ export function StylePanel({
     },
     [isControlled, onCollapsedChange],
   );
+  // An explicit request (Layers → "Open Style panel") expands the panel from its
+  // rail. Skipped while `autoCollapse` holds it closed (the notebook or a
+  // story-map presentation owns the workspace), so a request made there cannot
+  // pop Style back open over them: the `autoCollapse` effect below acts only on
+  // transitions, so an expand that slipped through would stick until the
+  // notebook was closed and reopened. The request is still consumed so it does
+  // not fire later.
+  const previousOpenRequest = useRef(openRequest);
+  useEffect(() => {
+    if (openRequest === previousOpenRequest.current) return;
+    previousOpenRequest.current = openRequest;
+    if (!autoCollapse) setIsCollapsed(false);
+  }, [autoCollapse, openRequest, setIsCollapsed]);
   // Collapse to the rail when `autoCollapse` flips on (e.g. the notebook opens),
   // and restore the prior expand/collapse state when it flips back off (notebook
   // closes). Both act only on the transition so the user can still toggle the
@@ -1028,6 +1111,13 @@ export function StylePanel({
   const [draftVectorStyleClassCount, setDraftVectorStyleClassCount] = useState(
     DEFAULT_LAYER_STYLE.vectorStyleClassCount,
   );
+  // "All categories" is a draft-only selection: the applied style records the
+  // class count it resolved to, so the panel seeds this flag from that count and
+  // then keeps it as the source of truth. Re-deriving it from
+  // `classCount === categorizedValueCount` would confuse "All" with a literal
+  // count that happens to match, and the two behave differently once the
+  // attribute changes underneath them.
+  const [draftVectorStyleAllCategories, setDraftVectorStyleAllCategories] = useState(false);
   const [draftVectorStyleColorRamp, setDraftVectorStyleColorRamp] = useState(
     DEFAULT_LAYER_STYLE.vectorStyleColorRamp,
   );
@@ -1057,11 +1147,21 @@ export function StylePanel({
     DEFAULT_LAYER_STYLE.extrusionAdvancedStyleEnabled,
   );
   const [vectorStyleError, setVectorStyleError] = useState<string | null>(null);
+  // Layers whose style suggestions the user waved off this session (#1519).
+  const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<string>>(() => new Set());
   const [extrusionError, setExtrusionError] = useState<string | null>(null);
+  const [proportionalSizeError, setProportionalSizeError] = useState<string | null>(null);
+  // Tracks auto-seeded proportional min/max so later tile samples can refine the
+  // range without overwriting a user's intentional 0–100 (or other) edit.
+  const seededProportionalBoundsRef = useRef<{
+    key: string;
+    min: number;
+    max: number;
+  } | null>(null);
   const [loadedVectorPropertyValues, setLoadedVectorPropertyValues] = useState<{
     layerId: string;
-    property: string;
-    values: unknown[];
+    /** Attribute samples keyed by property name (classification and/or size field). */
+    byProperty: Record<string, unknown[]>;
   } | null>(null);
   const [vectorPropertyValuesLoading, setVectorPropertyValuesLoading] = useState(false);
   const [vectorPropertyValuesUnavailable, setVectorPropertyValuesUnavailable] = useState(false);
@@ -1080,11 +1180,26 @@ export function StylePanel({
       }
     | null
   >(null);
-  // Close the builder when the selected layer changes: its fields, sample
-  // features, and target expression all belong to the previous layer.
+  // Close both dialogs when the selected layer changes. The builder's fields, sample features and
+  // target expression all belong to the previous layer; a paste box left open would submit one
+  // layer's style onto another.
   useEffect(() => {
     setExpressionBuilderTarget(null);
+    setPasteStyleOpen(false);
+    setPasteStyleNotice(null);
   }, [selectedLayerId]);
+
+  // Fade the header note the way the Layers panel fades its row status. Without this a stale
+  // "Style imported." stays pinned under the header while the user keeps working on the same layer.
+  // The cleanup covers a second import, a change of layer, and unmount.
+  useEffect(() => {
+    if (!pasteStyleNotice) return;
+    const timer = window.setTimeout(
+      () => setPasteStyleNotice(null),
+      IMPORTED_STYLE_NOTE_DURATION_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [pasteStyleNotice]);
 
   const layer = layers.find((l) => l.id === selectedLayerId);
 
@@ -1096,6 +1211,7 @@ export function StylePanel({
       setDraftVectorStyleMode(DEFAULT_LAYER_STYLE.vectorStyleMode);
       setDraftVectorStyleProperty(DEFAULT_LAYER_STYLE.vectorStyleProperty);
       setDraftVectorStyleClassCount(DEFAULT_LAYER_STYLE.vectorStyleClassCount);
+      setDraftVectorStyleAllCategories(false);
       setDraftVectorStyleColorRamp(DEFAULT_LAYER_STYLE.vectorStyleColorRamp);
       setDraftVectorStyleClassificationScheme(DEFAULT_LAYER_STYLE.vectorStyleClassificationScheme);
       setDraftVectorStyleStops(DEFAULT_LAYER_STYLE.vectorStyleStops);
@@ -1116,12 +1232,21 @@ export function StylePanel({
     setDraftHeightExpression(styleValue(layer.style, "extrusionHeightExpression"));
     const vectorStyleMode = styleValue(layer.style, "vectorStyleMode");
     setDraftVectorStyleMode(vectorStyleMode);
-    setDraftVectorStyleProperty(styleValue(layer.style, "vectorStyleProperty"));
-    setDraftVectorStyleClassCount(
-      normalizeVectorStyleClassCount(
-        vectorStyleMode,
-        styleValue(layer.style, "vectorStyleClassCount"),
-      ),
+    const vectorStyleProperty = styleValue(layer.style, "vectorStyleProperty");
+    setDraftVectorStyleProperty(vectorStyleProperty);
+    const vectorStyleClassCount = normalizeVectorStyleClassCount(
+      vectorStyleMode,
+      styleValue(layer.style, "vectorStyleClassCount"),
+    );
+    setDraftVectorStyleClassCount(vectorStyleClassCount);
+    // Values that load asynchronously are not available yet, so a re-opened
+    // panel recognizes "All" only for layers whose features are already in the
+    // store — elsewhere the resolved number stays selected until the user picks
+    // "All" again.
+    setDraftVectorStyleAllCategories(
+      vectorStyleMode === "categorized" &&
+        vectorStyleClassCount ===
+          completeCategorizedValueCount(layer, vectorStyleProperty, undefined),
     );
     setDraftVectorStyleColorRamp(styleValue(layer.style, "vectorStyleColorRamp"));
     setDraftVectorStyleClassificationScheme(
@@ -1161,20 +1286,36 @@ export function StylePanel({
   ]);
 
   // Add Vector Layer keeps large tiled datasets in DuckDB instead of copying
-  // their geometry into the app store. Read only the selected attribute when
-  // classification needs its values, so categorized and graduated styling
-  // remain available without defeating tiled rendering.
+  // their geometry into the app store. Read only the selected attribute(s) when
+  // classification or proportional sizing needs values, so categorized /
+  // graduated styling and size-by-value remain available without defeating
+  // tiled rendering. Classification and size fields are sampled together when
+  // they differ so proportional min/max can still seed from field B while
+  // graduated colors load field A.
   useEffect(() => {
-    const usesDuckDbVector = layer?.metadata.sourceKind === "maplibre-gl-vector";
+    if (!layer) return;
+    const usesDuckDbVector = layer.metadata.sourceKind === "maplibre-gl-vector";
     const usesVectorTiles =
-      layer?.type === "vector-tiles" || layer?.type === "pmtiles" || layer?.type === "mbtiles";
-    const needsValues =
-      (usesDuckDbVector || usesVectorTiles) &&
-      !layer.geojson &&
+      layer.type === "vector-tiles" || layer.type === "pmtiles" || layer.type === "mbtiles";
+    if (!(usesDuckDbVector || usesVectorTiles) || layer.geojson) {
+      setLoadedVectorPropertyValues(null);
+      setVectorPropertyValuesLoading(false);
+      setVectorPropertyValuesUnavailable(false);
+      return;
+    }
+
+    const classificationNeedsValues =
       (draftVectorStyleMode === "graduated" || draftVectorStyleMode === "categorized") &&
       draftVectorStyleProperty !== "";
+    const proportionalPropertyToLoad = styleValue(layer.style, "proportionalSizeProperty");
+    const proportionalNeedsValues =
+      styleValue(layer.style, "proportionalSizeEnabled") && proportionalPropertyToLoad !== "";
+    const propertiesToLoad = [
+      ...(classificationNeedsValues ? [draftVectorStyleProperty] : []),
+      ...(proportionalNeedsValues ? [proportionalPropertyToLoad] : []),
+    ].filter((property, index, all) => property !== "" && all.indexOf(property) === index);
 
-    if (!needsValues) {
+    if (propertiesToLoad.length === 0) {
       setLoadedVectorPropertyValues(null);
       setVectorPropertyValuesLoading(false);
       setVectorPropertyValuesUnavailable(false);
@@ -1183,7 +1324,10 @@ export function StylePanel({
 
     let cancelled = false;
     setLoadedVectorPropertyValues((current) =>
-      current?.layerId === layer.id && current.property === draftVectorStyleProperty
+      current?.layerId === layer.id &&
+      propertiesToLoad.every((property) =>
+        Object.prototype.hasOwnProperty.call(current.byProperty, property),
+      )
         ? current
         : null,
     );
@@ -1194,7 +1338,8 @@ export function StylePanel({
       // Tiled sources only expose the features currently loaded, so an empty
       // sample means the tiles have not arrived yet rather than an empty
       // attribute — keep re-reading until the map settles with features.
-      const map = mapControllerRef.current?.getMap();
+      const engine = mapControllerRef.current;
+      const map = vectorTileMap(engine);
       if (!map) {
         setLoadedVectorPropertyValues(null);
         setVectorPropertyValuesUnavailable(true);
@@ -1202,15 +1347,15 @@ export function StylePanel({
         return;
       }
       const sampleValues = (): boolean => {
-        const features = loadedVectorTileFeatures(map, layer);
+        const features = loadedVectorTileFeatures(map, layer, engine?.kind);
         if (features.length === 0) return false;
-        setLoadedVectorPropertyValues({
-          layerId: layer.id,
-          property: draftVectorStyleProperty,
-          values: features
-            .map((feature) => feature.properties?.[draftVectorStyleProperty])
-            .filter((value) => value !== null && value !== undefined),
-        });
+        const byProperty: Record<string, unknown[]> = {};
+        for (const property of propertiesToLoad) {
+          byProperty[property] = features
+            .map((feature) => feature.properties?.[property])
+            .filter((value) => value !== null && value !== undefined);
+        }
+        setLoadedVectorPropertyValues({ layerId: layer.id, byProperty });
         setVectorPropertyValuesLoading(false);
         return true;
       };
@@ -1239,19 +1384,24 @@ export function StylePanel({
       };
     }
 
-    void getVectorLayerPropertyValues(layer.id, draftVectorStyleProperty)
-      .then((values) => {
+    void Promise.all(
+      propertiesToLoad.map(async (property) => {
+        const values = await getVectorLayerPropertyValues(layer.id, property);
+        return [property, values] as const;
+      }),
+    )
+      .then((entries) => {
         if (cancelled) return;
-        if (values === null) {
-          setLoadedVectorPropertyValues(null);
-          setVectorPropertyValuesUnavailable(true);
-          return;
+        const byProperty: Record<string, unknown[]> = {};
+        for (const [property, values] of entries) {
+          if (values === null) {
+            setLoadedVectorPropertyValues(null);
+            setVectorPropertyValuesUnavailable(true);
+            return;
+          }
+          byProperty[property] = values;
         }
-        setLoadedVectorPropertyValues({
-          layerId: layer.id,
-          property: draftVectorStyleProperty,
-          values,
-        });
+        setLoadedVectorPropertyValues({ layerId: layer.id, byProperty });
       })
       .catch((error) => {
         if (!cancelled) {
@@ -1273,6 +1423,8 @@ export function StylePanel({
     layer?.geojson,
     layer?.id,
     layer?.metadata.sourceKind,
+    layer?.style.proportionalSizeEnabled,
+    layer?.style.proportionalSizeProperty,
     layer?.type,
   ]);
 
@@ -1281,11 +1433,12 @@ export function StylePanel({
       !layer ||
       !loadedVectorPropertyValues ||
       loadedVectorPropertyValues.layerId !== layer.id ||
-      loadedVectorPropertyValues.property !== draftVectorStyleProperty ||
       (draftVectorStyleMode !== "graduated" && draftVectorStyleMode !== "categorized")
     ) {
       return;
     }
+    const values = loadedVectorPropertyValues.byProperty[draftVectorStyleProperty];
+    if (!values) return;
 
     setDraftVectorStyleStops(
       createDefaultStops(
@@ -1295,7 +1448,7 @@ export function StylePanel({
         draftVectorStyleClassCount,
         draftVectorStyleColorRamp,
         draftVectorStyleClassificationScheme,
-        loadedVectorPropertyValues.values,
+        values,
       ),
     );
   }, [
@@ -1310,11 +1463,74 @@ export function StylePanel({
     loadedVectorPropertyValues,
   ]);
 
+  // When tiled attribute samples arrive for the proportional size field, seed
+  // (or refine) min/max. A ref records the last auto-applied range so a user's
+  // intentional 0–100 is never overwritten, while a partial first tile sample
+  // can still widen as more tiles load.
+  useEffect(() => {
+    if (!layer || !loadedVectorPropertyValues) return;
+    if (!styleValue(layer.style, "proportionalSizeEnabled")) return;
+    const property = styleValue(layer.style, "proportionalSizeProperty");
+    if (!property || loadedVectorPropertyValues.layerId !== layer.id) return;
+    const values = loadedVectorPropertyValues.byProperty[property];
+    // An empty tile sample is inconclusive — wait for features with values.
+    if (!values || values.length === 0) return;
+    const bounds = proportionalSizeBounds(layer, property, values);
+    if (!bounds) return;
+
+    const seedKey = `${layer.id}:${property}`;
+    const minValue = styleValue(layer.style, "proportionalSizeMinValue");
+    const maxValue = styleValue(layer.style, "proportionalSizeMaxValue");
+    const seeded = seededProportionalBoundsRef.current;
+
+    if (seeded?.key === seedKey) {
+      // Still wearing our auto-seed: refine when a richer sample expands/shifts it.
+      if (
+        minValue === seeded.min &&
+        maxValue === seeded.max &&
+        (bounds.min !== seeded.min || bounds.max !== seeded.max)
+      ) {
+        seededProportionalBoundsRef.current = {
+          key: seedKey,
+          min: bounds.min,
+          max: bounds.max,
+        };
+        setLayerStyle(layer.id, {
+          proportionalSizeMinValue: bounds.min,
+          proportionalSizeMaxValue: bounds.max,
+        });
+      }
+      return;
+    }
+
+    // New layer/property pair: only auto-seed from the unseeded defaults.
+    if (
+      minValue !== DEFAULT_LAYER_STYLE.proportionalSizeMinValue ||
+      maxValue !== DEFAULT_LAYER_STYLE.proportionalSizeMaxValue
+    ) {
+      // Non-default without our seed record → intentional; don't overwrite.
+      seededProportionalBoundsRef.current = { key: seedKey, min: minValue, max: maxValue };
+      return;
+    }
+
+    seededProportionalBoundsRef.current = {
+      key: seedKey,
+      min: bounds.min,
+      max: bounds.max,
+    };
+    setLayerStyle(layer.id, {
+      proportionalSizeMinValue: bounds.min,
+      proportionalSizeMaxValue: bounds.max,
+    });
+  }, [layer, loadedVectorPropertyValues, setLayerStyle]);
+
   // Reset the "show basemap layers" advanced toggle back to its clean default
   // whenever a different layer is selected. Keyed on the layer id alone so it
   // does not re-collapse while the user edits other style fields.
   useEffect(() => {
     setShowBasemapStyleLayers(false);
+    seededProportionalBoundsRef.current = null;
+    setProportionalSizeError(null);
   }, [layer?.id]);
 
   // Heatmap/cluster apply to point layers in two render paths: core GeoJSON
@@ -1331,6 +1547,30 @@ export function StylePanel({
     () => (layer ? getGeometryFlags(layer) : { hasPoint: true, hasLine: true, hasPolygon: true }),
     [layer],
   );
+  // Style suggestions (#1519). The candidate scan reads every feature's
+  // properties, so it is memoized alongside the other per-feature scans rather
+  // than re-run on every panel render (an opacity drag, a zoom-range edit).
+  // Kept before the early returns below so the hook order stays stable.
+  //
+  // isInitialLayerStyle is the gate: a layer only gets suggestions while it
+  // still wears exactly what it was added with. The renderer mode alone would
+  // let an edited fill or a restored project keep being offered advice.
+  //
+  // Deliberately NOT keyed on `layer`: that is `layers.find(...)`, and every
+  // `updateLayer` patch (an opacity drag, a rename, a zoom-range edit) rebuilds
+  // the layer object, so a `[layer]` dependency would re-scan on exactly the
+  // interactions this memo exists to survive. The fields below are the only
+  // ones the call actually reads, and each keeps its identity across an
+  // unrelated patch.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const styleSuggestions = useMemo(() => {
+    if (!layer || !isInitialLayerStyle(layer.style, layer.geojson)) return [];
+    return buildStyleSuggestions(layer, getAttributePropertyNames(layer), {
+      // Reuse the memo above rather than re-scanning: supportsPointRendererFor
+      // takes `pointOnly` precisely so the caller can.
+      supportsPointRenderer: supportsPointRendererFor(layer, isPointOnly),
+    });
+  }, [layer?.id, layer?.type, layer?.style, layer?.geojson, layer?.metadata, isPointOnly]);
   // Expression Builder inputs, memoized for stable identities: the dialog
   // memoizes its validation/preview/field-type work off these props, so fresh
   // arrays on every panel render would defeat that memoization while the
@@ -1339,6 +1579,48 @@ export function StylePanel({
   // hook order stays stable.
   const builderFeatures = useMemo(() => layer?.geojson?.features ?? [], [layer]);
   const builderFieldNames = useMemo(() => (layer ? getAttributePropertyNames(layer) : []), [layer]);
+  const countCompleteCategorizedValues = useCallback(
+    (property: string): number =>
+      completeCategorizedValueCount(
+        layer,
+        property,
+        layer && loadedVectorPropertyValues?.layerId === layer.id
+          ? loadedVectorPropertyValues.byProperty[property]
+          : undefined,
+      ),
+    // The count reads only these stable layer fields. Depending on the whole
+    // layer object would rescan every feature on any unrelated style edit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      layer?.geojson,
+      layer?.id,
+      layer?.metadata.sourceKind,
+      layer?.type,
+      loadedVectorPropertyValues,
+    ],
+  );
+  const categorizedValueCount = useMemo(
+    () =>
+      draftVectorStyleMode === "categorized"
+        ? countCompleteCategorizedValues(draftVectorStyleProperty)
+        : 0,
+    [countCompleteCategorizedValues, draftVectorStyleMode, draftVectorStyleProperty],
+  );
+
+  // The distinct-value count can land after the attribute was picked (DuckDB
+  // loads values asynchronously), so reconcile the class count once it arrives:
+  // "All" follows the new attribute's count, an explicit count only shrinks to
+  // fit. Tracking the "All" selection as its own flag — rather than inferring it
+  // from `classCount === categorizedValueCount` — is what makes the two cases
+  // distinguishable when the counts happen to coincide.
+  useEffect(() => {
+    if (draftVectorStyleMode !== "categorized" || categorizedValueCount === 0) return;
+    setDraftVectorStyleClassCount((current) =>
+      draftVectorStyleAllCategories || current > categorizedValueCount
+        ? categorizedValueCount
+        : current,
+    );
+  }, [categorizedValueCount, draftVectorStyleAllCategories, draftVectorStyleMode]);
   // Zoom and variables snapshot the camera via getState() when the builder
   // opens instead of subscribing: the dialog is modal (the map cannot move
   // while it is open), and mapView subscriptions would re-render this whole
@@ -1415,13 +1697,16 @@ export function StylePanel({
     diagramStyleSize,
     diagramStyleSizeProperty,
   ]);
-  // Numeric-attribute candidates for the diagram field pickers. Unlike
-  // graduated classification (which needs a value spread), one finite value
-  // qualifies. Memoized on the geojson/metadata (not the layer object) so
-  // unrelated panel edits never re-run the per-property feature scans. Kept
-  // before the early returns below so the hook order stays stable.
+  // Numeric-attribute candidates for the diagram and geometry-generator field
+  // pickers. Unlike graduated classification (which needs a value spread), one
+  // finite value qualifies. Both consumers only exist on layers that carry a
+  // local `geojson`, so scanning it directly (rather than the tiled sampling
+  // the proportional-size picker needs) is enough. Memoized on the
+  // geojson/metadata (not the layer object) so unrelated panel edits never
+  // re-run the per-property feature scans. Kept before the early returns below
+  // so the hook order stays stable.
   const diagramMetadata = layer?.metadata;
-  const diagramNumericProperties = useMemo(() => {
+  const numericPropertyOptions = useMemo(() => {
     if (!diagramGeojson) return [];
     const probe = { geojson: diagramGeojson, metadata: diagramMetadata ?? {} };
     return getAttributePropertyNames(probe).filter((property) =>
@@ -1444,6 +1729,16 @@ export function StylePanel({
     () =>
       layer?.type === "geojson" && layer.geojson ? geojsonHasZCoordinates(layer.geojson) : false,
     [layer?.type, layer?.geojson],
+  );
+
+  // Blend-mode support is decided when the map installs its render wrappers,
+  // which can happen after this panel first renders, so subscribe rather than
+  // read the module state once. Kept above the early returns below so the hook
+  // order stays stable.
+  const blendModesSupported = useSyncExternalStore(
+    subscribeLayerBlendModeSupport,
+    layerBlendModesSupported,
+    layerBlendModesSupported,
   );
 
   const resizeHandle = (
@@ -1524,11 +1819,22 @@ export function StylePanel({
   const isDeckVectorLayer = hasExternalDeckLayer(layer);
   const isRasterTileLayer = layer.metadata.tileType === "raster";
   const isThreeDTilesLayer = layer.type === "3d-tiles";
+  // A CZML scene reuses the `3d-tiles` type so the globe owns it, but
+  // `CesiumLayerSync` only toggles its visibility: no `Cesium3DTileStyle` is
+  // compiled for it and no feature filter reaches its entities, so the tileset
+  // symbology and quick-filter controls would be silent no-ops (#2290).
+  const isNativeDocumentScene = isCzmlLayer(layer) || isCesiumKmlLayer(layer);
+  const hasTilesetSymbology = isThreeDTilesLayer && !isNativeDocumentScene;
   // An external plugin's MapLibre custom (WebGL) layer draws its own pixels and
   // has no MapLibre paint properties, so every paint editor below would be inert
   // for it (#1445). The plugin declares that with `paintMode: "plugin"`; the
   // panel then offers only what actually reaches the layer.
   const isPluginPaintedLayer = pluginOwnsPaint(layer);
+  // An ArcGIS vector-tile layer with its resolved style keeps the service's
+  // own paint: layer sync forwards only opacity, order, zoom range, and
+  // filters to its native layers, so the color editors would be inert.
+  const isServiceStyledLayer = layer.type === "arcgis" && arcgisVectorStyle(layer) !== null;
+  const blendModeSelectId = `blend-mode-${layer.id}`;
   // Opacity survives the suppression when (and only when) the plugin bridged a
   // setter for it; otherwise the slider would be the same inert control.
   const hasBridgedOpacity = isPluginPaintedLayer && supportsBridgedOpacity(layer.id);
@@ -1537,6 +1843,7 @@ export function StylePanel({
     !isRasterTileLayer &&
     !isDeckRasterLayer &&
     !isPluginPaintedLayer &&
+    !isServiceStyledLayer &&
     (layer.type === "geojson" ||
       layer.type === "vector-tiles" ||
       layer.type === "mbtiles" ||
@@ -1547,21 +1854,35 @@ export function StylePanel({
     !isRasterTileLayer &&
     !isDeckRasterLayer &&
     !isPluginPaintedLayer &&
+    !isServiceStyledLayer &&
     supportsExtrusionControls(layer);
   const hasRasterPaintControls =
     !isPluginPaintedLayer &&
     (isRasterPaintLayer(layer.type) || isRasterTileLayer || isDeckRasterLayer);
   const hasTextMarkerControls = layer.type === "geojson" && hasTextMarkerFeatures(layer);
-  // isPointOnly is memoized above the early returns to keep hook order stable.
-  const isCoreGeoJsonPoint =
-    isPointOnly && !hasExternalNativeLayers(layer) && !hasExternalDeckLayer(layer);
-  const isVectorControlPoint =
-    hasExternalNativeLayers(layer) &&
+  // Quick filters compile to the per-feature MapLibre filter layer sync already
+  // applies, so they are offered exactly where that filter reaches: the layer
+  // types `withFeatureFilters` covers, plus any layer whose control registered
+  // native MapLibre layers for `applyExternalNativeFeatureFilters` to narrow
+  // (Add Vector Layer, vector PMTiles, and the plugin-painted vectors —
+  // filtering is independent of who owns the paint).
+  //
+  // Deliberately *not* keyed off `hasVectorPaintControls`: that set excludes
+  // plugin-painted layers, which do accept a filter, and includes deck.gl
+  // layers, which are MapLibre custom layers and accept none — offering a
+  // control there would be a control that quietly does nothing.
+  const hasQuickFilterControls =
+    // The deck.gl guard is outermost: a deck-rendered layer keeps its original
+    // `type` (a deck GeoJSON layer is still `"geojson"`), so testing the type
+    // first would let it through even though a custom layer accepts no filter.
     !hasExternalDeckLayer(layer) &&
-    layer.type === "geojson" &&
-    layer.metadata.sourceKind === "maplibre-gl-vector" &&
-    layer.metadata.geometryType === "point";
-  const supportsPointRenderer = isCoreGeoJsonPoint || isVectorControlPoint;
+    !isNativeDocumentScene &&
+    (layer.type === "geojson" ||
+      layer.type === "vector-tiles" ||
+      layer.type === "mbtiles" ||
+      hasExternalNativeLayers(layer));
+  // isPointOnly is memoized above the early returns to keep hook order stable.
+  const supportsPointRenderer = supportsPointRendererFor(layer, isPointOnly);
   // The "Sketches" layer mixes geometry types under one style, so "Circle
   // radius" only applies to its point markers and is misleading otherwise (#483).
   const isSketchLayer = layer.metadata.sourceKind === SKETCHES_SOURCE_KIND;
@@ -1571,6 +1892,19 @@ export function StylePanel({
   // for them, even if a hand-edited project set "meters".
   const strokeWidthInMeters = strokeWidthUnit === "meters" && !supportsPointRenderer;
   const pointRenderer = styleValue(style, "pointRenderer");
+  // Settings this layer turns on that the Mapbox renderer does not draw yet,
+  // named at the top of the panel so they do not silently do nothing.
+  const mapboxUnsupportedSettings =
+    mapboxPrimary && hasVectorPaintControls ? mapboxUnsupportedStyleSettings(layer) : [];
+  const arcgisUnsupportedSettings =
+    arcgisPrimary && hasVectorPaintControls
+      ? arcgisUnsupportedStyleSettings(layer, arcgisScene)
+      : [];
+  // A SceneView blends tiled rasters but ignores the colour sliders' effect.
+  const arcgisRasterEffectIgnored =
+    arcgisPrimary &&
+    arcgisScene &&
+    arcgisRasterEffect({ ...DEFAULT_LAYER_STYLE, ...style }) !== null;
   const extrusionEnabled = styleValue(style, "extrusionEnabled");
   const elevation3dEnabled = styleValue(style, "elevation3dEnabled");
   // Effective 3D Z-value mode: the saved flag can outlive the data's Z values
@@ -1617,11 +1951,11 @@ export function StylePanel({
     draftVectorStyleClassificationScheme !== styleValue(style, "vectorStyleClassificationScheme") ||
     draftVectorStyleExpression !== styleValue(style, "vectorStyleExpression") ||
     JSON.stringify(draftVectorStyleStops) !== JSON.stringify(currentVectorStops);
-  const draftVectorPropertyValues =
-    loadedVectorPropertyValues?.layerId === layer.id &&
-    loadedVectorPropertyValues.property === draftVectorStyleProperty
-      ? loadedVectorPropertyValues.values
+  const matchingPropertyValues = (property: string): unknown[] | undefined =>
+    loadedVectorPropertyValues?.layerId === layer.id
+      ? loadedVectorPropertyValues.byProperty[property]
       : undefined;
+  const draftVectorPropertyValues = matchingPropertyValues(draftVectorStyleProperty);
   const regenerateDraftVectorStyleStops = (
     mode: VectorStyleMode,
     property: string,
@@ -1652,6 +1986,7 @@ export function StylePanel({
     draftHeightExpression !== styleValue(style, "extrusionHeightExpression");
   const updateDraftVectorStyleMode = (mode: VectorStyleMode) => {
     setDraftVectorStyleMode(mode);
+    setDraftVectorStyleAllCategories(false);
     setVectorStyleError(null);
     if (mode === "graduated" || mode === "categorized") {
       const classCount = normalizeVectorStyleClassCount(mode, draftVectorStyleClassCount);
@@ -1678,18 +2013,31 @@ export function StylePanel({
     }
   };
   const updateDraftVectorStyleProperty = (property: string) => {
+    // The new attribute's count is 0 when its values have yet to load; keep the
+    // count within the plain options until then and let the reconcile effect
+    // above re-apply "All" once the real count arrives.
+    const nextCategoryCount =
+      draftVectorStyleMode === "categorized" ? countCompleteCategorizedValues(property) : 0;
+    const classCount =
+      nextCategoryCount > 0
+        ? draftVectorStyleAllCategories
+          ? nextCategoryCount
+          : Math.min(draftVectorStyleClassCount, nextCategoryCount)
+        : Math.min(draftVectorStyleClassCount, 12);
     setDraftVectorStyleProperty(property);
+    setDraftVectorStyleClassCount(classCount);
     regenerateDraftVectorStyleStops(
       draftVectorStyleMode,
       property,
-      draftVectorStyleClassCount,
+      classCount,
       draftVectorStyleColorRamp,
       draftVectorStyleClassificationScheme,
     );
   };
-  const updateDraftVectorStyleClassCount = (value: number) => {
+  const updateDraftVectorStyleClassCount = (value: number, allCategories = false) => {
     const classCount = normalizeVectorStyleClassCount(draftVectorStyleMode, value);
     setDraftVectorStyleClassCount(classCount);
+    setDraftVectorStyleAllCategories(allCategories);
     regenerateDraftVectorStyleStops(
       draftVectorStyleMode,
       draftVectorStyleProperty,
@@ -1943,6 +2291,33 @@ export function StylePanel({
       />
     </div>
   );
+  // How the layer composites onto the map beneath it (opengeos/GeoLibre#1981).
+  // Blending is applied while MapLibre draws the layer, so a layer painted by a
+  // plugin (`paintMode`) or rendered by a control (`customLayerType`: 3D Tiles,
+  // Gaussian splats, LiDAR, the COG raster engine, Add Vector Layer) can never
+  // honour it -- offering the menu there would only persist a mode nothing
+  // applies. `blendModesSupported` additionally drops it on a `maplibre-gl`
+  // build whose render seams moved; see `@geolibre/map`'s `layer-blend-modes`.
+  const blendModeControl =
+    !isPluginPaintedLayer && !controlRendersLayer(layer) && blendModesSupported ? (
+      <div className="space-y-2">
+        <Label htmlFor={blendModeSelectId}>{t("style.blendMode")}</Label>
+        <Select
+          id={blendModeSelectId}
+          aria-label={t("style.blendModeFor", { name: layer.name })}
+          value={styleValue(style, "blendMode") ?? DEFAULT_BLEND_MODE}
+          onChange={(event) =>
+            setLayerStyle(layer.id, { blendMode: event.target.value as BlendMode })
+          }
+        >
+          {BLEND_MODES.map((mode) => (
+            <option key={mode} value={mode}>
+              {t(`style.blendModes.${mode}` as ParseKeys)}
+            </option>
+          ))}
+        </Select>
+      </div>
+    ) : null;
   const usesAttributeSymbology =
     draftVectorStyleMode === "graduated" || draftVectorStyleMode === "categorized";
   const vectorClassificationSchemeOptions =
@@ -1952,7 +2327,10 @@ export function StylePanel({
   const vectorClassCountOptions = VECTOR_STYLE_CLASS_COUNTS.filter((classCount) =>
     draftVectorStyleMode === "categorized" ? true : classCount >= 2,
   );
-
+  // The "All (N)" option only renders while a complete count is known, so the
+  // selection falls back to the plain class count whenever it is not — keeping
+  // the controlled <select> value on an option that actually exists.
+  const allCategoriesSelected = draftVectorStyleAllCategories && categorizedValueCount > 0;
   // --- Rule-based renderer (immediate writes to style.vectorRules) ---
   const currentRules = styleValue(style, "vectorRules");
   const concreteRules = currentRules.filter((rule) => !rule.isElse);
@@ -2141,8 +2519,96 @@ export function StylePanel({
   const markerEnabled = styleValue(style, "markerEnabled");
   const markerShape = styleValue(style, "markerShape");
 
+  // --- Style suggestions (#1519) -------------------------------------------
+  // styleSuggestions is memoized above the early returns. Dismissal is
+  // per-layer and session-scoped — this is a nudge, not project state.
+  const visibleSuggestions = dismissedSuggestions.has(layer.id) ? [] : styleSuggestions;
+
+  const applyStyleSuggestion = (suggestion: StyleSuggestion) => {
+    if (suggestion.kind === "heatmap") {
+      setLayerStyle(layer.id, { pointRenderer: "heatmap" });
+      return;
+    }
+    const mode = suggestion.kind;
+    const property = suggestion.property ?? "";
+    const classCount = normalizeVectorStyleClassCount(
+      mode,
+      DEFAULT_LAYER_STYLE.vectorStyleClassCount,
+    );
+    const classificationScheme = defaultClassificationScheme(mode);
+    // The layer's committed ramp, not the draft dropdown: a suggestion should
+    // start from the same baseline every time, not from a ramp someone left
+    // selected in the editor without applying it.
+    const colorRamp = styleValue(style, "vectorStyleColorRamp");
+    const stops = normalizeVectorStyleStops(
+      mode,
+      createDefaultStops(layer, mode, property, classCount, colorRamp, classificationScheme),
+    );
+    // A suggestion that classifies to nothing (all-null column, one distinct
+    // value) would apply an empty renderer and blank the layer — the same
+    // guard applyVectorStyleSettings uses, just silent here.
+    if (mode === "graduated" ? stops.length < 2 : stops.length === 0) return;
+
+    setDraftVectorStyleMode(mode);
+    setDraftVectorStyleProperty(property);
+    setDraftVectorStyleClassCount(classCount);
+    setDraftVectorStyleAllCategories(false);
+    setDraftVectorStyleClassificationScheme(classificationScheme);
+    setDraftVectorStyleStops(stops);
+    setVectorStyleError(null);
+    setLayerStyle(layer.id, {
+      vectorStyleMode: mode,
+      vectorStyleProperty: property,
+      vectorStyleClassCount: classCount,
+      vectorStyleColorRamp: colorRamp,
+      vectorStyleClassificationScheme: classificationScheme,
+      vectorStyleStops: stops,
+    });
+  };
+
+  const suggestionLabel = (suggestion: StyleSuggestion): string =>
+    suggestion.kind === "heatmap"
+      ? t("style.suggestions.heatmap")
+      : t(
+          suggestion.kind === "categorized"
+            ? "style.suggestions.categorize"
+            : "style.suggestions.graduate",
+          { field: suggestion.property },
+        );
+
   const vectorSymbologyControls = (
     <div className="space-y-3">
+      {visibleSuggestions.length > 0 && (
+        <div className="space-y-2 rounded-md border border-dashed bg-muted/40 p-2">
+          <div className="flex items-center gap-2">
+            <Sparkles className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <span className="text-xs font-medium">{t("style.suggestions.title")}</span>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="ms-auto h-5 w-5"
+              aria-label={t("style.suggestions.dismiss")}
+              title={t("style.suggestions.dismiss")}
+              onClick={() => setDismissedSuggestions((current) => new Set(current).add(layer.id))}
+            >
+              <X className="h-3 w-3" />
+            </Button>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {visibleSuggestions.map((suggestion) => (
+              <Button
+                key={`${suggestion.kind}-${suggestion.property ?? ""}`}
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={() => applyStyleSuggestion(suggestion)}
+              >
+                {suggestionLabel(suggestion)}
+              </Button>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="space-y-2">
         <Label htmlFor="vectorStyleMode">{t("style.symbology.styleType")}</Label>
         <Select
@@ -2192,14 +2658,33 @@ export function StylePanel({
             <Label htmlFor="vectorStyleClassCount">{t("style.symbology.classes")}</Label>
             <Select
               id="vectorStyleClassCount"
-              value={String(draftVectorStyleClassCount)}
-              onChange={(event) => updateDraftVectorStyleClassCount(Number(event.target.value))}
+              value={allCategoriesSelected ? "all" : String(draftVectorStyleClassCount)}
+              onChange={(event) =>
+                updateDraftVectorStyleClassCount(
+                  event.target.value === "all" ? categorizedValueCount : Number(event.target.value),
+                  event.target.value === "all",
+                )
+              }
             >
-              {vectorClassCountOptions.map((classCount) => (
-                <option key={classCount} value={classCount}>
-                  {classCount}
+              {vectorClassCountOptions
+                .filter(
+                  (classCount) => !(allCategoriesSelected && classCount === categorizedValueCount),
+                )
+                .map((classCount) => (
+                  <option key={classCount} value={classCount}>
+                    {classCount}
+                  </option>
+                ))}
+              {draftVectorStyleClassCount > 12 && !allCategoriesSelected && (
+                <option value={draftVectorStyleClassCount}>{draftVectorStyleClassCount}</option>
+              )}
+              {draftVectorStyleMode === "categorized" && categorizedValueCount > 0 && (
+                <option value="all">
+                  {t("style.symbology.allClasses", {
+                    total: categorizedValueCount,
+                  })}
                 </option>
-              ))}
+              )}
             </Select>
           </div>
           <div className="space-y-2">
@@ -2620,6 +3105,37 @@ export function StylePanel({
       {vectorStyleError && <p className="text-xs text-destructive">{vectorStyleError}</p>}
     </div>
   );
+  /** True when a sample can prove the field lacks a usable numeric range (non-empty). */
+  const hasDecisivePropertySample = (property: string): boolean => {
+    if (layer.geojson?.features?.length) return true;
+    const sample = matchingPropertyValues(property);
+    // Empty tile samples are inconclusive — sparse/null viewport values must not
+    // disable a field that is numeric elsewhere in the dataset.
+    return Array.isArray(sample) && sample.length > 0;
+  };
+
+  const proportionalBoundsPatch = (property: string) => {
+    const bounds = proportionalSizeBounds(layer, property, matchingPropertyValues(property));
+    return bounds
+      ? { proportionalSizeMinValue: bounds.min, proportionalSizeMaxValue: bounds.max }
+      : null;
+  };
+
+  const rememberProportionalSeed = (property: string, min: number, max: number) => {
+    seededProportionalBoundsRef.current = { key: `${layer.id}:${property}`, min, max };
+  };
+
+  const clearProportionalSizeField = (disable: boolean, error: string | null = null) => {
+    seededProportionalBoundsRef.current = null;
+    setProportionalSizeError(error);
+    setLayerStyle(layer.id, {
+      ...(disable ? { proportionalSizeEnabled: false } : {}),
+      proportionalSizeProperty: "",
+      proportionalSizeMinValue: DEFAULT_LAYER_STYLE.proportionalSizeMinValue,
+      proportionalSizeMaxValue: DEFAULT_LAYER_STYLE.proportionalSizeMaxValue,
+    });
+  };
+
   const proportionalSizeControls = (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-2">
@@ -2629,15 +3145,49 @@ export function StylePanel({
             id="proportionalSizeEnabled"
             type="checkbox"
             checked={proportionalEnabled}
-            onChange={(event) =>
-              setLayerStyle(layer.id, {
-                proportionalSizeEnabled: event.target.checked,
-              })
-            }
+            onChange={(event) => {
+              const enabled = event.target.checked;
+              if (!enabled) {
+                setProportionalSizeError(null);
+                setLayerStyle(layer.id, { proportionalSizeEnabled: false });
+                return;
+              }
+              if (!proportionalProperty) {
+                setProportionalSizeError(null);
+                setLayerStyle(layer.id, { proportionalSizeEnabled: true });
+                return;
+              }
+              const boundsPatch = proportionalBoundsPatch(proportionalProperty);
+              if (boundsPatch) {
+                setProportionalSizeError(null);
+                rememberProportionalSeed(
+                  proportionalProperty,
+                  boundsPatch.proportionalSizeMinValue,
+                  boundsPatch.proportionalSizeMaxValue,
+                );
+                setLayerStyle(layer.id, {
+                  proportionalSizeEnabled: true,
+                  ...boundsPatch,
+                });
+                return;
+              }
+              // Non-empty sample proves the field is unusable — do not enable with a stale range.
+              if (hasDecisivePropertySample(proportionalProperty)) {
+                clearProportionalSizeField(true, t("style.symbology.errorProportionalSizeField"));
+                return;
+              }
+              // Tiled / unloaded / empty sample: enable and keep the field; the loader seeds bounds.
+              setProportionalSizeError(null);
+              setLayerStyle(layer.id, { proportionalSizeEnabled: true });
+            }}
           />
           {t("style.symbology.sizeByValue")}
         </label>
       </div>
+      {/* Outside the `proportionalEnabled` guard on purpose: rejecting a field
+          from the checkbox leaves proportional sizing off, so a message nested
+          inside that branch would unmount in the same render that set it. */}
+      {proportionalSizeError && <p className="text-xs text-destructive">{proportionalSizeError}</p>}
       {proportionalEnabled && (
         <>
           <div className="space-y-2">
@@ -2645,11 +3195,45 @@ export function StylePanel({
             <Select
               id="proportionalSizeProperty"
               value={proportionalProperty}
-              onChange={(event) =>
+              onChange={(event) => {
+                const property = event.target.value;
+                if (!property) {
+                  clearProportionalSizeField(false);
+                  return;
+                }
+                const boundsPatch = proportionalBoundsPatch(property);
+                if (boundsPatch) {
+                  setProportionalSizeError(null);
+                  rememberProportionalSeed(
+                    property,
+                    boundsPatch.proportionalSizeMinValue,
+                    boundsPatch.proportionalSizeMaxValue,
+                  );
+                  setLayerStyle(layer.id, {
+                    proportionalSizeProperty: property,
+                    ...boundsPatch,
+                  });
+                  return;
+                }
+                // Non-empty sample proves nonnumeric / constant — reject and clear stale range.
+                // Stay enabled: the user is mid-edit here, so keep the field select
+                // mounted next to the message instead of collapsing the section.
+                if (hasDecisivePropertySample(property)) {
+                  clearProportionalSizeField(
+                    false,
+                    t("style.symbology.errorProportionalSizeField"),
+                  );
+                  return;
+                }
+                // No decisive sample yet (tiled/empty): commit the field; defaults until load.
+                seededProportionalBoundsRef.current = null;
+                setProportionalSizeError(null);
                 setLayerStyle(layer.id, {
-                  proportionalSizeProperty: event.target.value,
-                })
-              }
+                  proportionalSizeProperty: property,
+                  proportionalSizeMinValue: DEFAULT_LAYER_STYLE.proportionalSizeMinValue,
+                  proportionalSizeMaxValue: DEFAULT_LAYER_STYLE.proportionalSizeMaxValue,
+                });
+              }}
               disabled={vectorStylePropertyOptions.length === 0}
             >
               {vectorStylePropertyOptions.length === 0 ? (
@@ -2665,6 +3249,16 @@ export function StylePanel({
                 </>
               )}
             </Select>
+            {vectorPropertyValuesLoading && (
+              <p className="text-xs text-muted-foreground">
+                {t("attributeTable.loadingAttributes")}
+              </p>
+            )}
+            {vectorPropertyValuesUnavailable && (
+              <p className="text-xs text-destructive">
+                {t("style.symbology.errorAttributesUnavailable")}
+              </p>
+            )}
           </div>
           <div className="grid grid-cols-2 gap-3">
             <NumericStyleInput
@@ -2947,6 +3541,69 @@ export function StylePanel({
   );
   // --- Geometry generator (per-feature derived geometry symbology) ---
   const generatorType = styleValue(style, "geometryGenerator");
+  const generatorSizeProperty = styleValue(style, "geometryGeneratorSizeProperty");
+  /**
+   * Picking a size field seeds the value range from the data, since an
+   * unseeded 0..100 default would map a population column onto a single
+   * radius. Unlike the proportional-size picker, this one offers numeric
+   * columns only, so there is no bad pick to reject after the fact — but
+   * `numericPropertyOptions` admits a column with a single numeric value,
+   * which has no spread to derive a range from. That case falls back to the
+   * defaults rather than keeping the previous field's range, which would
+   * scale the new field against numbers that never came from it.
+   */
+  const chooseGeneratorSizeProperty = (property: string) => {
+    if (!property) {
+      setLayerStyle(layer.id, { geometryGeneratorSizeProperty: "" });
+      return;
+    }
+    const bounds = proportionalSizeBounds(layer, property);
+    setLayerStyle(layer.id, {
+      geometryGeneratorSizeProperty: property,
+      geometryGeneratorSizeMinValue:
+        bounds?.min ?? DEFAULT_LAYER_STYLE.geometryGeneratorSizeMinValue,
+      geometryGeneratorSizeMaxValue:
+        bounds?.max ?? DEFAULT_LAYER_STYLE.geometryGeneratorSizeMaxValue,
+    });
+  };
+  const generatorFieldSelect = (
+    id: string,
+    label: string,
+    value: string,
+    onSelect: (property: string) => void,
+    emptyLabel = t("style.generator.fieldNone"),
+  ) => (
+    <div className="space-y-2">
+      <Label htmlFor={id}>{label}</Label>
+      <Select
+        id={id}
+        value={value}
+        onChange={(event) => onSelect(event.target.value)}
+        disabled={numericPropertyOptions.length === 0 && value === ""}
+      >
+        {numericPropertyOptions.length === 0 && value === "" ? (
+          <option value="">{t("style.labels.noAttributes")}</option>
+        ) : (
+          <>
+            <option value="">{emptyLabel}</option>
+            {numericPropertyOptions.map((property) => (
+              <option key={property} value={property}>
+                {property}
+              </option>
+            ))}
+            {/* A stored field that is not a numeric column here — a style
+                pasted from another layer, a `?style=` import, or data whose
+                schema changed — still renders as the selection. Without it
+                the browser would fall back to "None (fixed)" while the style
+                kept sizing by a field that resolves to null everywhere. */}
+            {value !== "" && !numericPropertyOptions.includes(value) ? (
+              <option value={value}>{value}</option>
+            ) : null}
+          </>
+        )}
+      </Select>
+    </div>
+  );
   const generatorControls = (
     <div className="space-y-3">
       <div className="space-y-2">
@@ -2970,17 +3627,31 @@ export function StylePanel({
       {generatorType !== "none" && (
         <>
           {generatorType === "buffer" && (
-            <NumericStyleInput
-              id="geometryGeneratorBufferDistance"
-              label={t("style.generator.bufferDistance")}
-              min={-100000}
-              max={1000000}
-              step={10}
-              value={styleValue(style, "geometryGeneratorBufferDistance")}
-              onChange={(geometryGeneratorBufferDistance) =>
-                setLayerStyle(layer.id, { geometryGeneratorBufferDistance })
-              }
-            />
+            <>
+              <NumericStyleInput
+                id="geometryGeneratorBufferDistance"
+                label={t("style.generator.bufferDistance")}
+                min={-100000}
+                max={1000000}
+                step={10}
+                value={styleValue(style, "geometryGeneratorBufferDistance")}
+                onChange={(geometryGeneratorBufferDistance) =>
+                  setLayerStyle(layer.id, { geometryGeneratorBufferDistance })
+                }
+              />
+              {generatorFieldSelect(
+                "geometryGeneratorBufferProperty",
+                t("style.generator.bufferField"),
+                styleValue(style, "geometryGeneratorBufferProperty"),
+                (geometryGeneratorBufferProperty) =>
+                  setLayerStyle(layer.id, { geometryGeneratorBufferProperty }),
+              )}
+              {styleValue(style, "geometryGeneratorBufferProperty") !== "" && (
+                <p className="text-xs text-muted-foreground">
+                  {t("style.generator.bufferFieldHint")}
+                </p>
+              )}
+            </>
           )}
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-2">
@@ -3031,24 +3702,88 @@ export function StylePanel({
             />
           </div>
           {generatorType === "centroid" && (
-            <NumericStyleInput
-              id="geometryGeneratorCircleRadius"
-              label={t("style.generator.circleRadius")}
-              min={1}
-              max={40}
-              step={1}
-              value={styleValue(style, "geometryGeneratorCircleRadius")}
-              onChange={(geometryGeneratorCircleRadius) =>
-                setLayerStyle(layer.id, { geometryGeneratorCircleRadius })
-              }
-            />
+            <>
+              {/* Stays visible with a size field chosen: it is the radius
+                  `generatorCircleRadiusValue` falls back to whenever the
+                  field's range turns out degenerate, so hiding it would leave
+                  the radius actually in use unreachable. */}
+              <NumericStyleInput
+                id="geometryGeneratorCircleRadius"
+                label={t("style.generator.circleRadius")}
+                min={1}
+                max={40}
+                step={1}
+                value={styleValue(style, "geometryGeneratorCircleRadius")}
+                onChange={(geometryGeneratorCircleRadius) =>
+                  setLayerStyle(layer.id, { geometryGeneratorCircleRadius })
+                }
+              />
+              {generatorFieldSelect(
+                "geometryGeneratorSizeProperty",
+                t("style.generator.sizeField"),
+                generatorSizeProperty,
+                chooseGeneratorSizeProperty,
+              )}
+              {generatorSizeProperty !== "" && (
+                <>
+                  <div className="grid grid-cols-2 gap-3">
+                    <NumericStyleInput
+                      id="geometryGeneratorSizeMinValue"
+                      label={t("style.symbology.minValue")}
+                      min={-1_000_000_000}
+                      max={1_000_000_000}
+                      step={1}
+                      value={styleValue(style, "geometryGeneratorSizeMinValue")}
+                      onChange={(geometryGeneratorSizeMinValue) =>
+                        setLayerStyle(layer.id, { geometryGeneratorSizeMinValue })
+                      }
+                    />
+                    <NumericStyleInput
+                      id="geometryGeneratorSizeMaxValue"
+                      label={t("style.symbology.maxValue")}
+                      min={-1_000_000_000}
+                      max={1_000_000_000}
+                      step={1}
+                      value={styleValue(style, "geometryGeneratorSizeMaxValue")}
+                      onChange={(geometryGeneratorSizeMaxValue) =>
+                        setLayerStyle(layer.id, { geometryGeneratorSizeMaxValue })
+                      }
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <NumericStyleInput
+                      id="geometryGeneratorSizeMinRadius"
+                      label={t("style.symbology.minSize")}
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={styleValue(style, "geometryGeneratorSizeMinRadius")}
+                      onChange={(geometryGeneratorSizeMinRadius) =>
+                        setLayerStyle(layer.id, { geometryGeneratorSizeMinRadius })
+                      }
+                    />
+                    <NumericStyleInput
+                      id="geometryGeneratorSizeMaxRadius"
+                      label={t("style.symbology.maxSize")}
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={styleValue(style, "geometryGeneratorSizeMaxRadius")}
+                      onChange={(geometryGeneratorSizeMaxRadius) =>
+                        setLayerStyle(layer.id, { geometryGeneratorSizeMaxRadius })
+                      }
+                    />
+                  </div>
+                </>
+              )}
+            </>
           )}
         </>
       )}
     </div>
   );
   // --- Diagram symbology (per-feature pie/bar charts, immediate writes) ---
-  // The numeric-attribute candidates (diagramNumericProperties) are memoized
+  // The numeric-attribute candidates (numericPropertyOptions) are memoized
   // above the early returns.
   const diagramType = styleValue(style, "diagramType");
   const diagramFields = styleValue(style, "diagramFields");
@@ -3057,7 +3792,7 @@ export function StylePanel({
     setLayerStyle(layer.id, { diagramFields: fields });
   const addDiagramField = () => {
     const used = new Set(diagramFields.map((field) => field.property));
-    const property = diagramNumericProperties.find((candidate) => !used.has(candidate)) ?? "";
+    const property = numericPropertyOptions.find((candidate) => !used.has(candidate)) ?? "";
     setDiagramFields([...diagramFields, { property, color: nextStopColor(diagramFields.length) }]);
   };
   const updateDiagramField = (index: number, patch: Partial<DiagramField>) =>
@@ -3072,7 +3807,7 @@ export function StylePanel({
     !!layer.geojson &&
     !hasExternalDeckLayer(layer) &&
     (!supportsPointRenderer || pointRenderer === "single") &&
-    (diagramNumericProperties.length > 0 || diagramFields.length > 0);
+    (numericPropertyOptions.length > 0 || diagramFields.length > 0);
 
   const diagramControls = (
     <div className="space-y-3">
@@ -3089,10 +3824,10 @@ export function StylePanel({
             if (
               nextType !== "none" &&
               diagramFields.length === 0 &&
-              diagramNumericProperties.length > 0
+              numericPropertyOptions.length > 0
             ) {
               setDiagramFields(
-                diagramNumericProperties.slice(0, 2).map((property, index) => ({
+                numericPropertyOptions.slice(0, 2).map((property, index) => ({
                   property,
                   color: nextStopColor(index),
                 })),
@@ -3155,13 +3890,12 @@ export function StylePanel({
                       }
                     >
                       <option value="">{t("style.symbology.chooseField")}</option>
-                      {diagramNumericProperties.map((property) => (
+                      {numericPropertyOptions.map((property) => (
                         <option key={property} value={property}>
                           {property}
                         </option>
                       ))}
-                      {field.property !== "" &&
-                      !diagramNumericProperties.includes(field.property) ? (
+                      {field.property !== "" && !numericPropertyOptions.includes(field.property) ? (
                         <option value={field.property}>{field.property}</option>
                       ) : null}
                     </Select>
@@ -3210,13 +3944,13 @@ export function StylePanel({
                 }
               >
                 <option value="">{t("style.symbology.chooseField")}</option>
-                {diagramNumericProperties.map((property) => (
+                {numericPropertyOptions.map((property) => (
                   <option key={property} value={property}>
                     {property}
                   </option>
                 ))}
                 {styleValue(style, "diagramSizeProperty") !== "" &&
-                !diagramNumericProperties.includes(styleValue(style, "diagramSizeProperty")) ? (
+                !numericPropertyOptions.includes(styleValue(style, "diagramSizeProperty")) ? (
                   <option value={styleValue(style, "diagramSizeProperty")}>
                     {styleValue(style, "diagramSizeProperty")}
                   </option>
@@ -3323,6 +4057,58 @@ export function StylePanel({
                 </>
               )}
             </Select>
+          </div>
+          <div className="space-y-2">
+            <label
+              htmlFor="labelNumberFormat"
+              className="flex items-center gap-2 text-sm font-medium"
+            >
+              <input
+                id="labelNumberFormat"
+                type="checkbox"
+                checked={labels.numberFormatEnabled}
+                onChange={(event) => updateLabels({ numberFormatEnabled: event.target.checked })}
+              />
+              {t("style.labels.numberFormat")}
+            </label>
+            {labels.numberFormatEnabled ? (
+              <>
+                <div className="grid grid-cols-2 gap-3">
+                  <NumericStyleInput
+                    id="labelNumberDecimals"
+                    label={t("style.labels.numberDecimals")}
+                    min={0}
+                    max={10}
+                    step={1}
+                    value={labels.numberDecimals}
+                    onChange={(numberDecimals) => updateLabels({ numberDecimals })}
+                  />
+                  <div className="space-y-2">
+                    <Label htmlFor="labelNumberLocale">{t("style.labels.numberLocale")}</Label>
+                    <Select
+                      id="labelNumberLocale"
+                      value={labels.numberLocale}
+                      onChange={(event) => updateLabels({ numberLocale: event.target.value })}
+                    >
+                      <option value="">{t("style.labels.numberLocaleApp")}</option>
+                      {LABEL_NUMBER_LOCALES.map((locale) => (
+                        <option key={locale} value={locale}>
+                          {formatLabelNumberSample(locale, labels.numberDecimals)}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {t("style.labels.numberFormatHint", {
+                    sample: formatLabelNumberSample(
+                      labels.numberLocale || i18n.language,
+                      labels.numberDecimals,
+                    ),
+                  })}
+                </p>
+              </>
+            ) : null}
           </div>
           <div className="space-y-2">
             <Label htmlFor="labelPlacement">{t("style.labels.placement")}</Label>
@@ -3630,6 +4416,29 @@ export function StylePanel({
           </div>
           {pointRenderer === "heatmap" ? (
             <>
+              {!controlRendersLayer(layer) ? (
+                <>
+                  <div className="space-y-2">
+                    <Label htmlFor="heatmapColorRamp">{t("style.symbology.colormap")}</Label>
+                    <ColorRampSelect
+                      id="heatmapColorRamp"
+                      aria-label={t("style.symbology.colormap")}
+                      value={styleValue(style, "heatmapColorRamp")}
+                      onValueChange={(heatmapColorRamp) =>
+                        setLayerStyle(layer.id, { heatmapColorRamp })
+                      }
+                      ramps={VECTOR_COLOR_RAMPS}
+                    />
+                  </div>
+                  {generatorFieldSelect(
+                    "heatmapWeightProperty",
+                    t("style.symbology.heatmapWeightField"),
+                    styleValue(style, "heatmapWeightProperty"),
+                    (heatmapWeightProperty) => setLayerStyle(layer.id, { heatmapWeightProperty }),
+                    t("style.symbology.heatmapEqualWeight"),
+                  )}
+                </>
+              ) : null}
               <NumericStyleInput
                 id="heatmapRadius"
                 label={t("style.symbology.heatmapRadius")}
@@ -4002,11 +4811,13 @@ export function StylePanel({
     </>
   );
 
-  if (isPluginPaintedLayer) {
+  if (isPluginPaintedLayer || isServiceStyledLayer) {
     // The plugin paints this layer itself, so the panel keeps only the controls
     // that still reach it: insert-below and the zoom range (MapLibre honors both
     // on a custom layer) plus Opacity when the registration bridged setOpacity.
-    // Everything else is styled from the plugin's own panel.
+    // Everything else is styled from the plugin's own panel. A service-styled
+    // ArcGIS layer lands here too; its opacity is a native paint property, so
+    // the slider always reaches it.
     return (
       <aside aria-label={t("style.panelLabel")} className={STYLE_PANEL_ASIDE_CLASS}>
         {resizeHandle}
@@ -4029,7 +4840,7 @@ export function StylePanel({
           <div className="space-y-4 p-3 pe-5">
             {beforeIdControl}
             {zoomRangeControls}
-            {hasBridgedOpacity && (
+            {(hasBridgedOpacity || isServiceStyledLayer) && (
               <RasterStyleSlider
                 label={t("style.raster.opacity")}
                 value={layer.opacity}
@@ -4039,10 +4850,26 @@ export function StylePanel({
                 onChange={(value) => setLayerOpacity(layer.id, value)}
               />
             )}
+            {/* Filtering is independent of who owns the paint: layer sync
+                narrows a plugin-painted layer's native layers just like any
+                other, so the section belongs here too. */}
+            {hasQuickFilterControls ? (
+              <>
+                <Separator />
+                <QuickFiltersSection
+                  key={`qf-${layer.id}`}
+                  layer={layer}
+                  mapControllerRef={mapControllerRef}
+                  mapReadyGeneration={mapReadyGeneration}
+                />
+              </>
+            ) : null}
           </div>
         </ScrollArea>
         <Separator />
-        <p className="p-2 text-[10px] text-muted-foreground">{t("style.pluginPaintedFooter")}</p>
+        <p className="p-2 text-[10px] text-muted-foreground">
+          {t(isServiceStyledLayer ? "style.serviceStyledFooter" : "style.pluginPaintedFooter")}
+        </p>
       </aside>
     );
   }
@@ -4070,6 +4897,18 @@ export function StylePanel({
           {/* Padding on the inner content with extra right clearance so the
               overlay scrollbar never covers a control's right edge. */}
           <div className="space-y-4 p-3 pe-5">
+            {arcgisRasterEffectIgnored && (
+              <div
+                className="text-xs text-amber-600"
+                data-testid="style-arcgis-unsupported"
+                role="note"
+              >
+                <p>{t("style.arcgisUnsupported.title")}</p>
+                <ul className="list-disc ps-4">
+                  <li>{t("style.arcgisUnsupported.rasterEffectScene")}</li>
+                </ul>
+              </div>
+            )}
             {beforeIdControl}
             {zoomRangeControls}
             <RasterStyleSlider
@@ -4080,6 +4919,7 @@ export function StylePanel({
               step={0.05}
               onChange={(value) => setLayerOpacity(layer.id, value)}
             />
+            {blendModeControl}
             {!isDeckRasterLayer && (
               <>
                 <RasterStyleSlider
@@ -4144,7 +4984,7 @@ export function StylePanel({
               </>
             )}
             {layer.metadata.sourceKind === RASTER_SOURCE_KIND && (
-              <RasterSymbologySection layer={layer} />
+              <RasterSymbologySection layer={layer} mapControllerRef={mapControllerRef} />
             )}
             {/* A Time Slider source is not in the raster plugin's registry, so
                 the section above has nothing to attach to; its own spec fields
@@ -4152,6 +4992,13 @@ export function StylePanel({
             {layer.metadata.sourceKind === TIME_SLIDER_SOURCE_KIND && (
               <TimeSliderSymbologySection layer={layer} />
             )}
+            {/* The same section the NetCDF branch renders below: a multiband COG
+                identified with the pixel inspector samples into the same store
+                (see useCogSpectralIdentify), so its spectra need a home on the
+                branch a raster layer actually lands on. The section renders null
+                until this layer has a sampled pixel, so it costs nothing for the
+                single-band and tile rasters that also come through here. */}
+            <NetcdfProfilePanel layerId={layer.id} />
             <Separator />
             <Button
               type="button"
@@ -4185,6 +5032,14 @@ export function StylePanel({
   }
 
   if (!hasVectorPaintControls) {
+    // The section renders nothing without retained grids, so ask here too, or
+    // the panel would suppress the fallback message and show an empty body.
+    // The layer state rather than `getNetcdfImageSource`, which is null for an
+    // RGB composite: that one has no colormap to re-apply, but it does have a
+    // band summary to show and pixels to sample.
+    const hasNetcdfSymbology =
+      layer.metadata.sourceKind === NETCDF_IMAGE_SOURCE_KIND &&
+      getNetcdfLayerState(layer.id) !== null;
     return (
       <aside aria-label={t("style.panelLabel")} className={STYLE_PANEL_ASIDE_CLASS}>
         {resizeHandle}
@@ -4203,11 +5058,59 @@ export function StylePanel({
             <PanelRightClose className="h-4 w-4" />
           </Button>
         </div>
-        <div className="space-y-4 p-3">{beforeIdControl}</div>
-        <p className="p-4 text-xs text-muted-foreground">{t("style.noControls")}</p>
+        <ScrollArea className="flex-1">
+          <div className="space-y-4 p-3 pe-5">
+            {beforeIdControl}
+            {blendModeControl}
+            {/* A NetCDF grid baked to pixels has no MapLibre paint properties,
+                so it lands in this branch; its colormap/limits are re-applied
+                by re-baking the image rather than by a style property. The
+                grids are dropped on a project reload, so the generic message
+                still has to appear for a layer restored from one. */}
+            {hasNetcdfSymbology ? (
+              <NetcdfSymbologySection layer={layer} />
+            ) : hasTilesetSymbology ? (
+              // A tileset has no MapLibre paint properties, but the globe can
+              // classify its features from the same symbology every vector
+              // layer uses — `CesiumLayerSync` compiles the colour expression
+              // and the layer filter into a `Cesium3DTileStyle` (#2290). The
+              // attribute list comes from `metadata.fields`, which the globe
+              // fills in from the first rendered tile, so it appears once the
+              // tileset has drawn rather than while it is still loading.
+              <>
+                <p className="text-xs text-muted-foreground">{t("style.tilesetSymbology")}</p>
+                {vectorSymbologyControls}
+              </>
+            ) : (
+              <p className="text-xs text-muted-foreground">{t("style.noControls")}</p>
+            )}
+            {hasNetcdfSymbology && <NetcdfProfilePanel layerId={layer.id} />}
+            {/* A layer with no paint controls of its own (a plugin owns its
+                paint, or a control paints it) can still be filtered, so the
+                Quick filters section is offered here too rather than only in
+                the full vector panel below. */}
+            {hasQuickFilterControls ? (
+              <>
+                <Separator />
+                <QuickFiltersSection
+                  key={`qf-${layer.id}`}
+                  layer={layer}
+                  mapControllerRef={mapControllerRef}
+                  mapReadyGeneration={mapReadyGeneration}
+                />
+              </>
+            ) : null}
+          </div>
+        </ScrollArea>
         <Separator />
         <p className="p-2 text-[10px] text-muted-foreground">
-          {t("style.selectedLayerType", { type: layer.type })}
+          {t("style.selectedLayerType", {
+            type: isCesiumKmlLayer(layer)
+              ? "KML / KMZ"
+              : isNativeDocumentScene
+                ? "czml"
+                : layer.type,
+          })}
         </p>
       </aside>
     );
@@ -4225,16 +5128,33 @@ export function StylePanel({
               panel also serves mbtiles/plugin/deck layers, where the dialog
               would open with Apply/Save disabled. */}
           {isStyleLibraryTargetLayer(layer.type) && (
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7"
-              title={t("style.openStyleManager")}
-              aria-label={t("style.openStyleManager")}
-              onClick={() => setStyleManagerOpen(true)}
-            >
-              <Palette className="h-4 w-4" />
-            </Button>
+            <>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                title={t("style.openStyleManager")}
+                aria-label={t("style.openStyleManager")}
+                onClick={() => setStyleManagerOpen(true)}
+              >
+                <Palette className="h-4 w-4" />
+              </Button>
+              {/* The other door into this is the layer's actions menu, a long way from where
+                  someone thinking about symbology already is. */}
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                title={t("layers.importStyleFromText")}
+                aria-label={t("layers.importStyleFromText")}
+                onClick={() => {
+                  setPasteStyleNotice(null);
+                  setPasteStyleOpen(true);
+                }}
+              >
+                <ClipboardType className="h-4 w-4" />
+              </Button>
+            </>
           )}
           <Button
             variant="ghost"
@@ -4248,6 +5168,45 @@ export function StylePanel({
           </Button>
         </div>
       </div>
+      {pasteStyleNotice && (
+        <p
+          className={`border-b px-3 py-1.5 text-xs ${
+            pasteStyleNotice.type === "warning" ? "text-amber-600" : "text-emerald-600"
+          }`}
+          data-testid="style-paste-notice"
+          role="status"
+        >
+          {pasteStyleNotice.message}
+        </p>
+      )}
+      {mapboxUnsupportedSettings.length > 0 && (
+        <div
+          className="border-b px-3 py-1.5 text-xs text-amber-600"
+          data-testid="style-mapbox-unsupported"
+          role="note"
+        >
+          <p>{t("style.mapboxUnsupported.title")}</p>
+          <ul className="list-disc ps-4">
+            {mapboxUnsupportedSettings.map((setting) => (
+              <li key={setting}>{t(`style.mapboxUnsupported.${setting}`)}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {arcgisUnsupportedSettings.length > 0 && (
+        <div
+          className="border-b px-3 py-1.5 text-xs text-amber-600"
+          data-testid="style-arcgis-unsupported"
+          role="note"
+        >
+          <p>{t("style.arcgisUnsupported.title")}</p>
+          <ul className="list-disc ps-4">
+            {arcgisUnsupportedSettings.map((setting) => (
+              <li key={setting}>{t(`style.arcgisUnsupported.${setting}`)}</li>
+            ))}
+          </ul>
+        </div>
+      )}
       <ScrollArea className="flex-1">
         {/* Padding lives on the inner content (not the ScrollArea root) with
             extra right clearance so the overlay scrollbar never covers the
@@ -4258,6 +5217,7 @@ export function StylePanel({
               min/max zoom range, so hide the controls rather than show a
               silently-ignored setting. */}
           {!elevation3dActive && zoomRangeControls}
+          {blendModeControl}
           {hasExtrusionControls && (
             <div className="space-y-2">
               <Label>{t("style.visualization")}</Label>
@@ -4373,6 +5333,20 @@ export function StylePanel({
               {labelControls}
             </>
           ) : null}
+          {/* Quick filters narrow what the layer draws, so they apply to every
+              vector layer — including tile-backed ones, which profile the
+              features currently loaded rather than a local copy. */}
+          {hasQuickFilterControls ? (
+            <>
+              <Separator />
+              <QuickFiltersSection
+                key={`qf-${layer.id}`}
+                layer={layer}
+                mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
+              />
+            </>
+          ) : null}
           {/* Persistent attribute joins need the layer's features in the store
               (layer.geojson); tile/service layers without an inline attribute
               table cannot be a join target. */}
@@ -4398,6 +5372,26 @@ export function StylePanel({
               <AttributeFormSection key={`af-${layer.id}`} layer={layer} />
             </>
           ) : null}
+          {/* The Popup designer reads the layer's field profile to offer the
+              fields, so like the sections above it needs the features in the
+              store. Keyed by layer so a half-edited expression never carries
+              over to the next layer. */}
+          {layer.geojson ? (
+            <>
+              <Separator />
+              <PopupSection key={`popup-${layer.id}`} layer={layer} />
+            </>
+          ) : null}
+          {/* Editor tracking stamps the features as they are created and edited,
+              so it needs the layer's features in the store as well. Keyed like
+              the sections above so a half-typed column name never carries over
+              to the next layer. */}
+          {layer.geojson ? (
+            <>
+              <Separator />
+              <EditorTrackingSection key={`et-${layer.id}`} layer={layer} />
+            </>
+          ) : null}
         </div>
       </ScrollArea>
       <Separator />
@@ -4411,6 +5405,20 @@ export function StylePanel({
               : t("style.footerMaplibre")}
       </p>
       {expressionBuilderDialog}
+      <PasteStyleDialog
+        open={pasteStyleOpen}
+        onOpenChange={setPasteStyleOpen}
+        onApply={(imported) => {
+          // Merge onto the store's current style, not the one this render closed over: the box can
+          // sit open while the panel's own controls edit the same layer. The layer *identity* is
+          // safe to close over, because a change of selection closes the dialog above.
+          const latest = useAppStore.getState().layers.find((c) => c.id === layer.id);
+          // Removed while the box was open — nothing to style.
+          if (!latest) return;
+          updateLayer(layer.id, { style: imported.apply(latest.style) });
+          setPasteStyleNotice(importedStyleNote(t, imported.warnings));
+        }}
+      />
     </aside>
   );
 }

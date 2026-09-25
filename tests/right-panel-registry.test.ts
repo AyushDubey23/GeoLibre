@@ -49,6 +49,7 @@ describe("right-panel registry", () => {
         onOpen: () => calls.push("open"),
         onCollapse: () => calls.push("collapse"),
         onClose: () => calls.push("close"),
+        onExplicitClose: () => calls.push("explicit-close"),
       }),
     );
 
@@ -67,7 +68,7 @@ describe("right-panel registry", () => {
     closeRightPanel("workbench");
     assert.equal(getActiveRightPanel(), null);
 
-    assert.deepEqual(calls, ["open", "collapse", "close"]);
+    assert.deepEqual(calls, ["open", "collapse", "close", "explicit-close"]);
   });
 
   it("returns false and warns when opening an unregistered id", () => {
@@ -106,12 +107,60 @@ describe("right-panel registry", () => {
     assert.deepEqual(calls, ["a:close", "b:open"]);
   });
 
-  it("defaults to right-of-style and honors a declared dock", () => {
+  it("does not fire onExplicitClose when another panel takes over", () => {
+    const calls: string[] = [];
+    registerRightPanel(
+      testPanel({ id: "a", title: "A", onExplicitClose: () => calls.push("a:explicit") }),
+    );
+    registerRightPanel(testPanel({ id: "b", title: "B" }));
+    openRightPanel("a");
+    openRightPanel("b");
+    assert.deepEqual(calls, []);
+
+    closeRightPanel("a");
+    assert.deepEqual(calls, ["a:explicit"]);
+  });
+
+  it("keeps displaced panels visible in their rails until explicitly closed", () => {
+    registerRightPanel(testPanel({ id: "browser", title: "Browser", dock: "replace-layers" }));
+    registerRightPanel(testPanel({ id: "comments", title: "Comments", dock: "replace-style" }));
+
+    openRightPanel("browser");
+    openRightPanel("comments");
+
+    assert.equal(getActiveRightPanel(), "comments");
+    assert.deepEqual(getRightPanelSnapshot().visibleIds, ["browser", "comments"]);
+
+    closeRightPanel("browser");
+    assert.equal(getActiveRightPanel(), "comments");
+    assert.deepEqual(getRightPanelSnapshot().visibleIds, ["comments"]);
+    // Closing also forgets the panel's remembered dock, so re-enabling it later
+    // starts from its declared dock rather than wherever it was last moved.
+    assert.equal("browser" in getRightPanelSnapshot().panelDocks, false);
+  });
+
+  it("preserves each visible panel's merged dock while another panel is active", () => {
+    registerRightPanel(testPanel({ id: "comments", title: "Comments", dock: "replace-style" }));
+    registerRightPanel(testPanel({ id: "catalog", title: "Catalog", dock: "right-of-style" }));
+
+    openRightPanel("comments");
+    openRightPanel("catalog");
+    setActiveRightPanelDock("replace-style");
+    openRightPanel("comments");
+
+    assert.equal(getActiveRightPanel(), "comments");
+    assert.equal(getRightPanelSnapshot().panelDocks.comments, "replace-style");
+    assert.equal(getRightPanelSnapshot().panelDocks.catalog, "replace-style");
+    // Re-activating a still-visible panel restores its remembered dock.
+    assert.equal(getActiveRightPanelDock(), "replace-style");
+  });
+
+  it("defaults to the shared Style rail and honors a declared dock", () => {
     registerRightPanel(testPanel({ id: "r", title: "R" }));
     registerRightPanel(testPanel({ id: "l", title: "L", dock: "left-of-layers" }));
     openRightPanel("r");
-    assert.equal(getActiveRightPanelDock(), "right-of-style");
-    assert.equal(getRightPanelSnapshot().dock, "right-of-style");
+    assert.equal(getActiveRightPanelDock(), "replace-style");
+    assert.equal(getRightPanelSnapshot().dock, "replace-style");
     openRightPanel("l");
     assert.equal(getActiveRightPanelDock(), "left-of-layers");
   });
@@ -120,7 +169,7 @@ describe("right-panel registry", () => {
     registerRightPanel(testPanel({ id: "a", title: "A" }));
     registerRightPanel(testPanel({ id: "b", title: "B" }));
     openRightPanel("a");
-    assert.equal(getActiveRightPanelDock(), "right-of-style");
+    assert.equal(getActiveRightPanelDock(), "replace-style");
 
     setActiveRightPanelDock("left-of-style");
     assert.equal(getActiveRightPanelDock(), "left-of-style");
@@ -142,7 +191,7 @@ describe("right-panel registry", () => {
 
     // Opening another panel resets to that panel's declared dock.
     openRightPanel("b");
-    assert.equal(getActiveRightPanelDock(), "right-of-style");
+    assert.equal(getActiveRightPanelDock(), "replace-style");
     // Closing clears the dock entirely.
     closeRightPanel("b");
     assert.equal(getActiveRightPanelDock(), null);
@@ -191,14 +240,14 @@ describe("right-panel registry", () => {
     assert.equal(getActiveRightPanelDock(), "right-of-layers");
   });
 
-  it("falls back to right-of-style for an unknown declared dock", () => {
+  it("falls back to the shared Style rail for an unknown declared dock", () => {
     registerRightPanel(
       testPanel({
         dock: "nonsense" as unknown as GeoLibreRightPanelRegistration["dock"],
       }),
     );
     openRightPanel("workbench");
-    assert.equal(getActiveRightPanelDock(), "right-of-style");
+    assert.equal(getActiveRightPanelDock(), "replace-style");
   });
 
   it("ignores dock changes when no panel is active", () => {

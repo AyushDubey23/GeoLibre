@@ -1,12 +1,18 @@
 import { useAppStore } from "@geolibre/core";
 import { type RefObject, useEffect } from "react";
-import type { MapController } from "@geolibre/map";
+import { getLayerBounds, type MapEngine } from "@geolibre/map";
+import { imageBlobToDataUrl } from "@geolibre/map";
 import {
-  EMBED_ORIGIN_WILDCARD,
   buildEmbedEvent,
+  buildEmbedLayer,
+  embedEventTargets,
+  embedEventVersions,
+  embedLayerSummaries,
+  embedRequestVersion,
   isEmbedOriginAllowed,
   parseEmbedRequest,
   readEmbedOrigins,
+  requireEmbedLayer,
   resolveHighlightIds,
   type EmbedCommand,
   type EmbedEventType,
@@ -14,6 +20,8 @@ import {
 import { fetchProjectFromUrl, projectUrlFromLocation } from "../lib/project-url";
 import { resolveProjectXyzLayers } from "../lib/xyz-url";
 import { isKnownWhiteboxToolId } from "../lib/whitebox-tool-url";
+import { loadDataUrl } from "./useDataUrlLoader";
+import type { createAppAPI } from "./usePlugins";
 
 // Runtime `postMessage` API for a host page that frames GeoLibre (issue #1462).
 // Where `?url=`, `?maponly`, and `?tool=` configure the app once at load time,
@@ -46,43 +54,68 @@ const VIEW_THROTTLE_MS = 250;
  * @param mapControllerRef - Ref to the live map controller (shared with
  *   MapCanvas and the other bridges), used to drive and read the camera.
  */
-export function useEmbedApi(mapControllerRef: RefObject<MapController | null>): void {
+export function useEmbedApi(
+  mapControllerRef: RefObject<MapEngine | null>,
+  mapAppAPI: ReturnType<typeof createAppAPI> | null,
+  /**
+   * Bumped whenever a canvas publishes an engine, so the view-listener attach
+   * re-arms on a hand-off — the ref itself is stable (#2268 review).
+   */
+  mapReadyGeneration: number,
+): void {
   useEffect(() => {
     if (typeof window === "undefined") return;
+    // `ready` promises that every command is usable. Plugin-backed data loaders
+    // join the API only after the map has initialized, so do not advertise the
+    // bridge during the earlier render where that API is still absent.
+    if (!mapAppAPI) return;
     const allowedOrigins = readEmbedOrigins();
     if (allowedOrigins.length === 0) return;
     const host = window.parent;
     // Not framed: there is no host to talk to (the app is the top-level page).
     if (!host || host === window) return;
 
-    const wildcard = allowedOrigins.includes(EMBED_ORIGIN_WILDCARD);
-    // Learned from the host's first allowed message; until then broadcasts go to
-    // each configured origin, so the host never has to speak first to hear
-    // `ready`. Scoping to the exact origin afterwards keeps later payloads off
-    // any other frame that happens to share the allowlist.
+    // Both learned from the host's first allowed message, and both pinned for
+    // the rest of the session; see `embedEventTargets` / `embedEventVersions`
+    // for what each is null until then.
     let hostOrigin: string | null = null;
+    let hostVersion: 1 | 2 | null = null;
     let disposed = false;
 
-    const emit = (type: EmbedEventType, payload: Record<string, unknown>) => {
+    const emit = (type: EmbedEventType, payload: Record<string, unknown>, version?: 1 | 2) => {
       if (disposed) return;
-      const message = buildEmbedEvent(type, payload);
-      const targets = hostOrigin
-        ? [hostOrigin]
-        : wildcard
-          ? [EMBED_ORIGIN_WILDCARD]
-          : allowedOrigins;
-      for (const target of targets) {
-        try {
-          host.postMessage(message, target);
-        } catch (error) {
-          console.error("[GeoLibre] Failed to post embed event", error);
+      const targets = embedEventTargets(hostOrigin, allowedOrigins);
+      const versions = embedEventVersions(version, hostVersion);
+      for (const eventVersion of versions) {
+        const message = buildEmbedEvent(type, payload, eventVersion);
+        for (const target of targets) {
+          try {
+            host.postMessage(message, target);
+          } catch (error) {
+            console.error("[GeoLibre] Failed to post embed event", error);
+          }
         }
       }
     };
 
-    const ack = (requestId: string | null, ok: boolean, error?: string) => {
+    const ack = (
+      requestId: string | null,
+      version: 1 | 2,
+      ok: boolean,
+      error?: string,
+      result?: unknown,
+    ) => {
       if (!requestId) return;
-      emit("ack", { requestId, ok, ...(error ? { error } : {}) });
+      emit(
+        "ack",
+        {
+          requestId,
+          ok,
+          ...(error ? { error } : {}),
+          ...(result === undefined ? {} : { result }),
+        },
+        version,
+      );
     };
 
     const controller = () => mapControllerRef.current;
@@ -93,6 +126,17 @@ export function useEmbedApi(mapControllerRef: RefObject<MapController | null>): 
     // host can tell its own load from one the user triggered.
     let projectSourceUrl: string | null = projectUrlFromLocation();
     let loadAbort: AbortController | null = null;
+    const dataLoadAborts = new Set<AbortController>();
+    let dataLoadQueue: Promise<void> = Promise.resolve();
+
+    const queueDataLoad = <T>(operation: () => Promise<T>): Promise<T> => {
+      const next = dataLoadQueue.then(operation, operation);
+      dataLoadQueue = next.then(
+        () => undefined,
+        () => undefined,
+      );
+      return next;
+    };
 
     const loadProjectFromUrl = async (url: string) => {
       // A second load supersedes the first; otherwise a slow fetch could land
@@ -166,10 +210,20 @@ export function useEmbedApi(mapControllerRef: RefObject<MapController | null>): 
       state.setProcessingOpen(true);
     };
 
-    const runCommand = async (command: EmbedCommand): Promise<void> => {
+    const requireLayer = (layerId: string) =>
+      requireEmbedLayer(useAppStore.getState().layers, layerId);
+
+    const runCommand = async (command: EmbedCommand): Promise<unknown> => {
       switch (command.type) {
         case "loadProject":
+          if (!useAppStore.getState().deploymentCapabilities.has("project:edit"))
+            throw new Error("Missing project:edit capability");
           await loadProjectFromUrl(command.url);
+          return;
+        case "getRenderer":
+          return useAppStore.getState().primaryRenderer;
+        case "setRenderer":
+          useAppStore.getState().setPrimaryRenderer(command.renderer);
           return;
         case "setView":
           applySetView(command);
@@ -178,8 +232,71 @@ export function useEmbedApi(mapControllerRef: RefObject<MapController | null>): 
           applyHighlight(command);
           return;
         case "openTool":
+          if (!useAppStore.getState().deploymentCapabilities.has("processing:run"))
+            throw new Error("Missing processing:run capability");
           applyOpenTool(command);
           return;
+        case "setLayerVisibility":
+          requireLayer(command.layerId);
+          useAppStore.getState().setLayerVisibility(command.layerId, command.visible);
+          return;
+        case "listLayers":
+          return embedLayerSummaries(useAppStore.getState().layers);
+        case "setFilter":
+          requireLayer(command.layerId);
+          useAppStore.getState().updateLayer(command.layerId, {
+            embedFilter: command.expression ?? undefined,
+          });
+          return;
+        case "getViewport": {
+          const view = controller()?.readView();
+          if (!view) throw new Error("The map is not ready yet");
+          return view;
+        }
+        case "addLayer": {
+          const state = useAppStore.getState();
+          if (!state.deploymentCapabilities.has("data:add"))
+            throw new Error("Missing data:add capability");
+          const layer = buildEmbedLayer(command.spec, state.layers);
+          state.addLayer(layer, command.spec.beforeId);
+          return layer.id;
+        }
+        case "addData": {
+          if (!useAppStore.getState().deploymentCapabilities.has("data:add"))
+            throw new Error("Missing data:add capability");
+          const abort = new AbortController();
+          dataLoadAborts.add(abort);
+          const result = await queueDataLoad(() =>
+            loadDataUrl(mapAppAPI, command.url, {
+              styleUrl: command.styleUrl,
+              signal: abort.signal,
+              fit: command.fit,
+            }),
+          ).finally(() => dataLoadAborts.delete(abort));
+          if (command.fit) {
+            const bounds = useAppStore
+              .getState()
+              .layers.filter((layer) => result.fitLayerIds.includes(layer.id))
+              .map(getLayerBounds)
+              .filter((value) => value !== null);
+            if (bounds.length) {
+              controller()?.fitBounds([
+                Math.min(...bounds.map((value) => value[0])),
+                Math.min(...bounds.map((value) => value[1])),
+                Math.max(...bounds.map((value) => value[2])),
+                Math.max(...bounds.map((value) => value[3])),
+              ]);
+            }
+          }
+          return result.layerIds;
+        }
+        case "exportImage": {
+          if (!useAppStore.getState().deploymentCapabilities.has("export:data"))
+            throw new Error("Missing export:data capability");
+          const engine = controller();
+          if (!engine) throw new Error("The map is not ready yet");
+          return imageBlobToDataUrl(await engine.captureImage());
+        }
       }
     };
 
@@ -192,14 +309,21 @@ export function useEmbedApi(mapControllerRef: RefObject<MapController | null>): 
       // exactly this origin. ("null" is an opaque origin, only reachable under
       // the wildcard, and cannot be used as a postMessage target.)
       if (!hostOrigin && event.origin && event.origin !== "null") hostOrigin = event.origin;
+      const requestVersion = embedRequestVersion(event.data);
+      hostVersion ??= requestVersion;
       if ("error" in request) {
-        ack(request.requestId, false, request.error);
+        ack(request.requestId, requestVersion, false, request.error);
         return;
       }
       void runCommand(request.command).then(
-        () => ack(request.requestId, true),
+        (result) => ack(request.requestId, requestVersion, true, undefined, result),
         (error: unknown) => {
-          ack(request.requestId, false, error instanceof Error ? error.message : String(error));
+          ack(
+            request.requestId,
+            requestVersion,
+            false,
+            error instanceof Error ? error.message : String(error),
+          );
         },
       );
     };
@@ -209,12 +333,17 @@ export function useEmbedApi(mapControllerRef: RefObject<MapController | null>): 
     // -- events --------------------------------------------------------------
 
     const store = useAppStore.getState();
+    let prevRenderer = store.primaryRenderer;
     let prevGeneration = store.projectGeneration;
     let prevSelectedLayer = store.selectedLayerId;
     let prevSelection = store.selectedFeatureIds.join(" ");
     const emittedRuns = new Set(store.processingHistory.map((run) => run.id));
 
     const unsubscribe = useAppStore.subscribe((state) => {
+      if (state.primaryRenderer !== prevRenderer) {
+        prevRenderer = state.primaryRenderer;
+        emit("rendererchange", { renderer: prevRenderer });
+      }
       if (state.projectGeneration !== prevGeneration) {
         prevGeneration = state.projectGeneration;
         emit("projectLoaded", {
@@ -253,9 +382,10 @@ export function useEmbedApi(mapControllerRef: RefObject<MapController | null>): 
       }
     });
 
-    // Camera events. The controller and its map appear asynchronously, so poll
-    // animation frames until the map exists (same pattern as useCommandBridge).
-    let viewMap: ReturnType<MapController["getMap"]> | null = null;
+    // Camera events. The engine appears asynchronously after its canvas mounts,
+    // so poll only until the renderer-neutral event surface is published.
+    let unsubscribeMove: (() => void) | null = null;
+    let unsubscribeIdle: (() => void) | null = null;
     let lastViewAt = 0;
     let trailingTimer: number | null = null;
     const postView = () => {
@@ -290,29 +420,37 @@ export function useEmbedApi(mapControllerRef: RefObject<MapController | null>): 
     };
     let rafId: number | null = null;
     const attach = () => {
-      const map = controller()?.getMap();
-      if (!map) {
+      const engine = controller();
+      if (!engine) {
         rafId = requestAnimationFrame(attach);
         return;
       }
-      viewMap = map;
-      map.on("move", onMapMove);
-      map.on("moveend", onMapMove);
+      unsubscribeMove = engine.onCameraMove(onMapMove);
+      unsubscribeIdle = engine.onCameraIdle(onMapMove);
     };
     rafId = requestAnimationFrame(attach);
 
-    emit("ready", { version: __GEOLIBRE_VERSION__ });
+    // A renderer hand-off bumps the generation before the destination engine
+    // has published, so this effect re-runs while the ref is still empty (or
+    // aimed at the outgoing engine). `ready` promises every command is usable:
+    // hold it until the engine for the current renderer is live, and the
+    // publish bump re-runs this effect to emit it then.
+    const engine = controller();
+    if (engine && engine.kind === useAppStore.getState().primaryRenderer) {
+      emit("ready", { version: __GEOLIBRE_VERSION__ });
+    }
 
     return () => {
       disposed = true;
       window.removeEventListener("message", handleMessage);
       unsubscribe();
       loadAbort?.abort();
+      for (const abort of dataLoadAborts) abort.abort();
+      dataLoadAborts.clear();
       if (rafId !== null) cancelAnimationFrame(rafId);
       if (trailingTimer !== null) window.clearTimeout(trailingTimer);
-      viewMap?.off("move", onMapMove);
-      viewMap?.off("moveend", onMapMove);
+      unsubscribeMove?.();
+      unsubscribeIdle?.();
     };
-    // Mount-only: mapControllerRef is a stable ref read lazily inside handlers.
-  }, [mapControllerRef]);
+  }, [mapControllerRef, mapAppAPI, mapReadyGeneration]);
 }

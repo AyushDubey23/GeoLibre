@@ -123,6 +123,9 @@ export const OS_ENV_VAR_NAMES: readonly string[] = [
   "OPENAI_COMPATIBLE_MODEL",
   // Web-search tool (Tavily).
   "TAVILY_API_KEY",
+  // TypeSafe fast path (assistant/fast-path.ts). Optional: without it the
+  // assistant simply routes every request through the model as before.
+  "JEV_API_KEY",
 ];
 
 /**
@@ -173,6 +176,10 @@ export interface RuntimeEnvSources {
   geocoderEnv: Record<string, string>;
   /** The device-local Cesium Ion token as `VITE_CESIUM_TOKEN`, or empty. */
   cesiumEnv: Record<string, string>;
+  /** Device-local Mapbox token; explicit project entries still win. */
+  mapboxEnv?: Record<string, string>;
+  /** Device-local ArcGIS API key as `VITE_ARCGIS_API_KEY`; project entries still win. */
+  arcgisEnv?: Record<string, string>;
   /** The project's explicit Environment variables. Highest precedence. */
   projectEnv: Record<string, string>;
 }
@@ -193,6 +200,8 @@ export function mergeRuntimeEnv({
   aiEnv,
   geocoderEnv,
   cesiumEnv,
+  mapboxEnv,
+  arcgisEnv,
   projectEnv,
 }: RuntimeEnvSources): RuntimeEnv {
   return {
@@ -200,6 +209,8 @@ export function mergeRuntimeEnv({
     ...aiEnv,
     ...geocoderEnv,
     ...cesiumEnv,
+    ...mapboxEnv,
+    ...arcgisEnv,
     ...projectEnv,
   };
 }
@@ -267,11 +278,23 @@ function browserOrigin(): string | undefined {
   return origin && origin !== "null" ? origin : undefined;
 }
 
-function managedProxyBaseUrl(proxyUrl: string, baseOrigin?: string): string {
-  let normalized = proxyUrl.trim().replace(/\/+$/, "");
+/**
+ * Absolutize a configured proxy path against the page origin.
+ *
+ * A same-origin `/path` form is what a reverse proxy in front of the app
+ * configures, and Tauri's native HTTP client cannot resolve a relative URL, so
+ * it has to become absolute before it reaches either transport.
+ */
+function managedProxyPath(proxyUrl: string, baseOrigin?: string): string {
+  const normalized = proxyUrl.trim().replace(/\/+$/, "");
   if (baseOrigin && normalized.startsWith("/")) {
-    normalized = new URL(normalized, baseOrigin).toString().replace(/\/+$/, "");
+    return new URL(normalized, baseOrigin).toString().replace(/\/+$/, "");
   }
+  return normalized;
+}
+
+function managedProxyBaseUrl(proxyUrl: string, baseOrigin?: string): string {
+  const normalized = managedProxyPath(proxyUrl, baseOrigin);
   return normalized.endsWith("/v1") ? normalized : `${normalized}/v1`;
 }
 
@@ -284,11 +307,20 @@ export function readBuildTimeAssistantEnv(
 ): RuntimeEnv {
   if (!viteEnv) return {};
   const result: RuntimeEnv = {};
+  // Routing endpoint for the assistant's fast path. Separate from the chat
+  // proxy because the two need not be the same service: the dev server proxies
+  // only routing, and a deployment may add routing without moving chat.
+  const fastPathUrl = viteEnv.VITE_GEOLIBRE_FAST_PATH_URL?.trim().replace(/\/+$/, "");
+  if (fastPathUrl) {
+    result.GEOLIBRE_FAST_PATH_URL = managedProxyPath(fastPathUrl, baseOrigin);
+  }
   const proxyUrl = viteEnv.VITE_GEOLIBRE_AI_URL?.trim().replace(/\/+$/, "");
   if (proxyUrl) {
     result.OPENAI_COMPATIBLE_BASE_URL = managedProxyBaseUrl(proxyUrl, baseOrigin);
     result.OPENAI_COMPATIBLE_MODEL =
-      viteEnv.VITE_GEOLIBRE_AI_MODEL?.trim() || result.OPENAI_COMPATIBLE_MODEL || "openai/gpt-5.5";
+      viteEnv.VITE_GEOLIBRE_AI_MODEL?.trim() ||
+      result.OPENAI_COMPATIBLE_MODEL ||
+      "openai/gpt-5.6-luna";
   }
   return result;
 }
@@ -491,6 +523,70 @@ export function availableProviders(env: RuntimeEnv = readRuntimeEnv()): Assistan
 }
 
 /**
+ * Headers the OpenAI SDK attaches to every request that carry no meaning for a
+ * third-party OpenAI-compatible endpoint: its own telemetry (`X-Stainless-*`)
+ * and a `User-Agent` override.
+ *
+ * They are harmless against `api.openai.com`, but they break OpenAI-compatible
+ * gateways in the browser (issue #1834). Any of them makes the request
+ * non-simple, so the browser sends a CORS preflight listing every one of them in
+ * `Access-Control-Request-Headers`. A gateway that allows only the standard
+ * `Authorization`/`Content-Type`/`Accept` trio answers that preflight without an
+ * `Access-Control-Allow-Origin` header, the browser rejects it, and the SDK sees
+ * the opaque `TypeError: Failed to fetch`, reported as "Connection error" with
+ * three identical network diagnostics (one per SDK retry) even though the
+ * endpoint's CORS policy is otherwise fine and the credentials are valid.
+ *
+ * Dropping them leaves the preflight asking only for headers such a gateway
+ * already allows. `User-Agent` is included because the browser supplies its own
+ * once the SDK's override is gone.
+ *
+ * This is exactly the set the client attaches to *every* request. The SDK's
+ * remaining `X-Stainless-*` names (`Helper-Method`, `Poll-Helper`,
+ * `Custom-Poll-Interval`) are deliberately absent: they are set per request by
+ * the assistants/vector-store polling helpers, whose per-request headers are
+ * merged *after* `defaultHeaders` and so cannot be stripped here anyway. The
+ * assistant reaches the API through plain `chat.completions.create`, which never
+ * uses those helpers. The `openAiCompatibleHeaders` test asserts the header
+ * names actually put on the wire, so an SDK bump that adds one to every request
+ * fails there rather than in a user's gateway.
+ */
+export const OPENAI_COMPATIBLE_STRIPPED_HEADERS: readonly string[] = [
+  "User-Agent",
+  "X-Stainless-Arch",
+  "X-Stainless-Lang",
+  "X-Stainless-OS",
+  "X-Stainless-Package-Version",
+  "X-Stainless-Retry-Count",
+  "X-Stainless-Runtime",
+  "X-Stainless-Runtime-Version",
+  "X-Stainless-Timeout",
+];
+
+/**
+ * The `defaultHeaders` to hand the OpenAI SDK for an OpenAI-compatible endpoint
+ * (`ollama` / `custom`).
+ *
+ * A `null` value tells the SDK to *remove* that header rather than send an empty
+ * one, and `defaultHeaders` is merged after the block where the client sets its
+ * own, so every name in {@link OPENAI_COMPATIBLE_STRIPPED_HEADERS} is dropped
+ * before the request is built. `Authorization` joins them when the endpoint is
+ * the managed same-origin proxy, which is authenticated by the browser session
+ * instead of a Bearer token.
+ *
+ * @param suppressAuthorizationHeader Also drop `Authorization` (managed proxy).
+ * @returns A header map whose every value is `null`.
+ */
+export function openAiCompatibleHeaders(
+  suppressAuthorizationHeader: boolean,
+): Record<string, null> {
+  const headers: Record<string, null> = {};
+  for (const name of OPENAI_COMPATIBLE_STRIPPED_HEADERS) headers[name] = null;
+  if (suppressAuthorizationHeader) headers.Authorization = null;
+  return headers;
+}
+
+/**
  * Build a Strands {@link Model} for the resolved provider. The provider SDK is
  * dynamically imported so unused providers never enter the initial bundle.
  *
@@ -537,7 +633,7 @@ export async function createModel(config: AssistantProviderConfig): Promise<Mode
         modelId: config.modelId,
         clientConfig: {
           baseURL: config.baseURL,
-          defaultHeaders: config.suppressAuthorizationHeader ? { Authorization: null } : undefined,
+          defaultHeaders: openAiCompatibleHeaders(Boolean(config.suppressAuthorizationHeader)),
           dangerouslyAllowBrowser: true,
         },
       }) as unknown as Model;

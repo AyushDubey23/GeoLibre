@@ -77,6 +77,15 @@ const BENIGN_CONSOLE_WARNINGS = [
   "WARNING: Multiple instances of Three.js being imported.",
 ];
 
+// ResizeObserver reports a delivery-cycle guard through window.onerror even
+// though no application exception was thrown. The browser defers the remaining
+// notifications to the next frame, so recording it as a runtime error produces
+// noisy `/:0:0` diagnostics during ordinary panel and map resizing.
+const BENIGN_WINDOW_ERRORS = [
+  "ResizeObserver loop completed with undelivered notifications.",
+  "ResizeObserver loop limit exceeded",
+];
+
 /** Whether a console.warn message is a known-benign warning to drop entirely. */
 function isBenignConsoleWarning(args: unknown[]): boolean {
   return (
@@ -419,10 +428,19 @@ export function installDiagnosticsCapture(): () => void {
     const forwarded = stripOptionalResourceHeader(input, init);
 
     try {
-      const response = await originalFetch(forwarded.input, forwarded.init);
+      const response =
+        forwarded.init !== undefined
+          ? await originalFetch(forwarded.input, forwarded.init)
+          : await originalFetch(forwarded.input);
+      // A completed `no-cors` fetch resolves to an opaque response whose real
+      // status is deliberately hidden as 0 and whose `ok` flag is false. That
+      // is not evidence of a failed request: genuine network failures reject
+      // the fetch and are handled by the catch block below. The same applies to
+      // a manually followed cross-origin redirect (`opaqueredirect`).
+      const opaque = response.type === "opaque" || response.type === "opaqueredirect";
       appendDiagnostic({
         category: "network",
-        level: response.ok || optional ? "info" : "error",
+        level: response.ok || optional || opaque ? "info" : "error",
         message: `${method} ${response.status} ${response.statusText}`.trim(),
         durationMs: Math.round(performance.now() - startedAt),
         method,
@@ -507,6 +525,12 @@ export function installDiagnosticsCapture(): () => void {
   };
 
   const handleWindowError = (event: ErrorEvent) => {
+    if (BENIGN_WINDOW_ERRORS.includes(event.message)) {
+      // Suppress Chromium/WebKit's console error as well as the diagnostics
+      // entry. ResizeObserver will deliver the deferred notification next frame.
+      event.preventDefault();
+      return;
+    }
     appendDiagnostic({
       category: "runtime",
       level: "error",

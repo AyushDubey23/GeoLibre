@@ -1,4 +1,10 @@
-import { redo, undo, useAppStore } from "@geolibre/core";
+import {
+  canRedoProjectRestore,
+  canUndoProjectRestore,
+  redo,
+  undo,
+  useAppStore,
+} from "@geolibre/core";
 import { useEffect } from "react";
 
 /** True when focus is in a text-editing surface (let the browser handle undo). */
@@ -19,6 +25,11 @@ export function useUndoRedoShortcuts(): void {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey)) return;
       if (isEditableTarget(e.target)) return;
+      // Undo/redo author the project, so a deployment that withheld
+      // `project:edit` withholds the keys too (issue #1673). This handler is
+      // its own listener rather than a registry command, so the capability
+      // filter on the command palette never sees it.
+      if (!useAppStore.getState().deploymentCapabilities.has("project:edit")) return;
       const key = e.key.toLowerCase();
       // Ctrl/Cmd+Shift+Z, or the Windows-style Ctrl+Y (Ctrl only, not Cmd+Y).
       const isRedo = (key === "z" && e.shiftKey) || (key === "y" && e.ctrlKey && !e.shiftKey);
@@ -27,10 +38,10 @@ export function useUndoRedoShortcuts(): void {
       // Only consume the event when there is actually something to do, so an
       // empty stack doesn't swallow the browser/OS shortcut (e.g. Cmd+Y).
       const temporal = useAppStore.temporal.getState();
-      if (isRedo && temporal.futureStates.length > 0) {
+      if (isRedo && (temporal.futureStates.length > 0 || canRedoProjectRestore())) {
         e.preventDefault();
         redo();
-      } else if (isUndo && temporal.pastStates.length > 0) {
+      } else if (isUndo && (temporal.pastStates.length > 0 || canUndoProjectRestore())) {
         e.preventDefault();
         undo();
       }

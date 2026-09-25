@@ -1,5 +1,12 @@
-import { redo, undo, useAppStore } from "@geolibre/core";
-import type { MapController } from "@geolibre/map";
+import {
+  canRedoProjectRestore,
+  canUndoProjectRestore,
+  redo,
+  subscribeProjectRestoreHistory,
+  undo,
+  useAppStore,
+} from "@geolibre/core";
+import type { MapEngine } from "@geolibre/map";
 import {
   Button,
   DropdownMenu,
@@ -22,6 +29,7 @@ import {
   X,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useSyncExternalStore } from "react";
 import { useStore } from "zustand";
 import { useDesktopSettingsStore } from "../../../hooks/useDesktopSettings";
 import {
@@ -30,12 +38,13 @@ import {
   invertLayerSelection,
   zoomToSelection,
 } from "../../../lib/selection-actions";
+import { editMenuItemCapability } from "../../../lib/deployment-gates";
 import { isMenuItemVisible } from "../../../lib/ui-profile";
 import type { ToolbarChrome } from "./constants";
 
 interface EditMenuProps {
   chrome: ToolbarChrome;
-  mapControllerRef: React.RefObject<MapController | null>;
+  mapControllerRef: React.RefObject<MapEngine | null>;
 }
 
 /**
@@ -45,8 +54,20 @@ interface EditMenuProps {
  */
 export function EditMenu({ chrome, mapControllerRef }: EditMenuProps) {
   const { t } = useTranslation();
-  const canUndo = useStore(useAppStore.temporal, (s) => s.pastStates.length > 0);
-  const canRedo = useStore(useAppStore.temporal, (s) => s.futureStates.length > 0);
+  const temporalCanUndo = useStore(useAppStore.temporal, (s) => s.pastStates.length > 0);
+  const temporalCanRedo = useStore(useAppStore.temporal, (s) => s.futureStates.length > 0);
+  const canUndoRestore = useSyncExternalStore(
+    subscribeProjectRestoreHistory,
+    canUndoProjectRestore,
+    canUndoProjectRestore,
+  );
+  const canRedoRestore = useSyncExternalStore(
+    subscribeProjectRestoreHistory,
+    canRedoProjectRestore,
+    canRedoProjectRestore,
+  );
+  const canUndo = temporalCanUndo || canUndoRestore;
+  const canRedo = temporalCanRedo || canRedoRestore;
   const setSelectByExpressionOpen = useAppStore((s) => s.setSelectByExpressionOpen);
   const setSelectByLocationOpen = useAppStore((s) => s.setSelectByLocationOpen);
   // Narrow boolean/number selectors so the menu re-renders only when the
@@ -67,7 +88,14 @@ export function EditMenu({ chrome, mapControllerRef }: EditMenuProps) {
   const selectionCount = useAppStore((s) => s.selectedFeatureIds.length);
   const hasSelection = activeLayerSelectable && selectionCount > 0;
   const uiProfile = useDesktopSettingsStore((s) => s.desktopSettings.uiProfile);
-  const show = (id: string) => isMenuItemVisible(uiProfile, id);
+  const deploymentCapabilities = useAppStore((s) => s.deploymentCapabilities);
+  // Same dual gate as ProjectMenu: the deployment's capability first (not on
+  // offer at all), then the interface profile (decluttering the user can undo).
+  const show = (id: string) => {
+    const required = editMenuItemCapability(id);
+    if (required && !deploymentCapabilities.has(required)) return false;
+    return isMenuItemVisible(uiProfile, id);
+  };
 
   const handleExportSelection = () => {
     const layer = useAppStore
@@ -82,7 +110,7 @@ export function EditMenu({ chrome, mapControllerRef }: EditMenuProps) {
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button
-          className={chrome.secondaryButtonClass}
+          className={chrome.buttonClass}
           variant="ghost"
           size={chrome.buttonSize}
           aria-label={t("toolbar.menu.edit")}

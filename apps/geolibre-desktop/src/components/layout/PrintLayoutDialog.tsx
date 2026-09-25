@@ -5,8 +5,9 @@ import {
   getVectorColorRamp,
   useAppStore,
   VECTOR_COLOR_RAMPS,
+  type PrintLayoutConfig,
 } from "@geolibre/core";
-import { loadMarkerSvgImage, type MapController } from "@geolibre/map";
+import { loadMarkerSvgImage, type MapEngine } from "@geolibre/map";
 import { GRATICULE_LABEL_LAYER_ID } from "@geolibre/plugins";
 import {
   Button,
@@ -42,8 +43,10 @@ import {
 import {
   computeScaleRatio,
   drawLayout,
+  mapBodyAspectRatio,
   PAPER_SIZES,
   resolvePageSize,
+  scaleZoomTarget,
   type BodyCorner,
   type CustomSize,
   type LayoutOptions,
@@ -58,11 +61,15 @@ import {
   DEFAULT_TABLE_ROWS,
   layerRows,
   MAX_TABLE_ROWS,
+  rowForAtlasFeature,
+  rowsIntersectingBounds,
   rowsWithinBounds,
   type ChartBlockType,
+  type PageFilterMode,
 } from "../../lib/print-data-blocks";
 import {
-  categoricalColumns,
+  categoryColumnOptions,
+  coerceNumericStringRows,
   numericColumns,
   type BarAggregation,
   type ChartRow,
@@ -70,6 +77,7 @@ import {
 import {
   clearPrintExtent,
   drawPrintExtent,
+  drawEnginePrintExtent,
   setPrintExtentVisible,
   showPrintExtent,
   type PrintExtent,
@@ -78,11 +86,13 @@ import {
   applyLegendConfig,
   buildLegend,
   captureMapImage,
+  captureEngineMapImage,
   copyLayoutToClipboard,
   exportAtlasPdf,
   exportAtlasPngZip,
   exportLayoutPdf,
   exportLayoutPng,
+  exportLayoutSvg,
   legendEditorRows,
   reorderLegendEntry,
   setLegendItemLabel,
@@ -91,9 +101,11 @@ import {
 } from "../../lib/print-layout-export";
 import {
   atlasEntryName,
+  atlasViewportFrame,
   buildAtlasPages,
   buildLineAtlasPages,
   collectAtlasFeatures,
+  geometryBounds,
   hasLineGeometry,
   MAX_LINE_ATLAS_PAGES,
   expandBounds,
@@ -106,11 +118,16 @@ import {
   type AtlasPage,
   type AtlasTokenContext,
 } from "../../lib/print-atlas";
+import { clearAtlasFeatureMask } from "../../lib/print-atlas-mask";
+import { atlasCamera } from "../../lib/print-atlas-camera";
+import { engineStyleMap } from "../../lib/engine-style-map";
+import { useMapCapabilities } from "../../hooks/useMapCapabilities";
+import { clamp } from "../../lib/clamp";
 
 interface PrintLayoutDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  mapControllerRef: React.RefObject<MapController | null>;
+  mapControllerRef: React.RefObject<MapEngine | null>;
 }
 
 /** Common industry scale denominators offered as quick presets (GH #522). */
@@ -164,7 +181,7 @@ function ToggleField({ id, label, checked, disabled, onChange }: ToggleFieldProp
 /**
  * Print Layout composer dialog: captures the current map view and composes it
  * with a title, legend, scale bar, north arrow, and footer onto a chosen paper
- * or screen size, then exports the result to PNG or PDF.
+ * or screen size, then exports the result to PNG, PDF, or SVG.
  */
 export function PrintLayoutDialog({
   open,
@@ -179,40 +196,58 @@ export function PrintLayoutDialog({
   // Follow the map's scale-bar unit preference so the printed bar matches the
   // on-screen one (metric / imperial / nautical).
   const scaleUnit = useAppStore((s) => s.preferences.map.scaleUnit);
+  // The project's zoom limits. An engine without a MapLibre map exposes none of
+  // its own, but `applyMapPreferences` feeds it these (clamped to [0, 24], the
+  // range every engine accepts), so they are what its camera can reach.
+  const prefMinZoom = useAppStore((s) => s.preferences.map.minZoom);
+  const prefMaxZoom = useAppStore((s) => s.preferences.map.maxZoom);
+  const setPrintLayout = useAppStore((s) => s.setPrintLayout);
+  // The composer's settings belong to the project, so the controls start from
+  // what it was saved with. Read once per mount: the dialog is remounted on
+  // every project load (see the `key` at its render site), which is what makes
+  // an opened project's layout reach these controls instead of the previous
+  // project's (GeoLibre discussion #1992).
+  const [initialLayout] = useState<PrintLayoutConfig>(() => useAppStore.getState().printLayout);
 
-  const [title, setTitle] = useState("");
-  const [subtitle, setSubtitle] = useState("");
-  const [titlePlacement, setTitlePlacement] = useState<"outside" | "inside">("outside");
-  const [titleAlign, setTitleAlign] = useState<"left" | "center" | "right">("center");
-  const [paperSize, setPaperSize] = useState<PaperSizeId>("a4");
-  const [orientation, setOrientation] = useState<Orientation>("landscape");
-  const [customWidth, setCustomWidth] = useState(1280);
-  const [customHeight, setCustomHeight] = useState(720);
-  const [customUnit, setCustomUnit] = useState<SizeUnit>("px");
-  const [showTitle, setShowTitle] = useState(true);
-  const [showSubtitle, setShowSubtitle] = useState(true);
-  const [showLegend, setShowLegend] = useState(true);
-  const [showScaleBar, setShowScaleBar] = useState(true);
-  const [showNorthArrow, setShowNorthArrow] = useState(true);
-  const [navigationGrouped, setNavigationGrouped] = useState(true);
-  const [showFooter, setShowFooter] = useState(false);
-  const [footerText, setFooterText] = useState("");
-  const [showDate, setShowDate] = useState(true);
-  const [dateText, setDateText] = useState("");
-  const [showAttribution, setShowAttribution] = useState(true);
-  const [pageMargin, setPageMargin] = useState<"normal" | "narrow" | "none">("normal");
-  const [showPageBorder, setShowPageBorder] = useState(false);
-  const [pageBorderColor, setPageBorderColor] = useState("#111827");
-  const [pageBorderWidth, setPageBorderWidth] = useState(2);
+  const [title, setTitle] = useState(initialLayout.title);
+  const [subtitle, setSubtitle] = useState(initialLayout.subtitle);
+  const [titlePlacement, setTitlePlacement] = useState<"outside" | "inside">(
+    initialLayout.titlePlacement,
+  );
+  const [titleAlign, setTitleAlign] = useState<"left" | "center" | "right">(
+    initialLayout.titleAlign,
+  );
+  const [paperSize, setPaperSize] = useState<PaperSizeId>(initialLayout.paperSize);
+  const [orientation, setOrientation] = useState<Orientation>(initialLayout.orientation);
+  const [customWidth, setCustomWidth] = useState(initialLayout.customWidth);
+  const [customHeight, setCustomHeight] = useState(initialLayout.customHeight);
+  const [customUnit, setCustomUnit] = useState<SizeUnit>(initialLayout.customUnit);
+  const [showTitle, setShowTitle] = useState(initialLayout.showTitle);
+  const [showSubtitle, setShowSubtitle] = useState(initialLayout.showSubtitle);
+  const [showLegend, setShowLegend] = useState(initialLayout.showLegend);
+  const [showScaleBar, setShowScaleBar] = useState(initialLayout.showScaleBar);
+  const [showNorthArrow, setShowNorthArrow] = useState(initialLayout.showNorthArrow);
+  const [navigationGrouped, setNavigationGrouped] = useState(initialLayout.navigationGrouped);
+  const [showFooter, setShowFooter] = useState(initialLayout.showFooter);
+  const [footerText, setFooterText] = useState(initialLayout.footerText);
+  const [showDate, setShowDate] = useState(initialLayout.showDate);
+  const [dateText, setDateText] = useState(initialLayout.dateText);
+  const [showAttribution, setShowAttribution] = useState(initialLayout.showAttribution);
+  const [pageMargin, setPageMargin] = useState<"normal" | "narrow" | "none">(
+    initialLayout.pageMargin,
+  );
+  const [showPageBorder, setShowPageBorder] = useState(initialLayout.showPageBorder);
+  const [pageBorderColor, setPageBorderColor] = useState(initialLayout.pageBorderColor);
+  const [pageBorderWidth, setPageBorderWidth] = useState(initialLayout.pageBorderWidth);
   // Map frame (the border around the map body). Width is a 0–10 scale; 0 hides
   // the frame. Defaults match the original hardcoded hairline (GH #749).
-  const [mapBorderColor, setMapBorderColor] = useState("#9ca3af");
-  const [mapBorderWidth, setMapBorderWidth] = useState(1);
-  const [mapBackground, setMapBackground] = useState("#e5e7eb");
+  const [mapBorderColor, setMapBorderColor] = useState(initialLayout.mapBorderColor);
+  const [mapBorderWidth, setMapBorderWidth] = useState(initialLayout.mapBorderWidth);
+  const [mapBackground, setMapBackground] = useState(initialLayout.mapBackground);
   // Draft for the free-form hex field; only complete #RGB / #RRGGBB values are
   // committed to mapBackground (which also drives <input type="color"> and the
   // canvas fillStyle), so a half-typed "#" never corrupts the layout colour.
-  const [mapBackgroundDraft, setMapBackgroundDraft] = useState("#e5e7eb");
+  const [mapBackgroundDraft, setMapBackgroundDraft] = useState(initialLayout.mapBackground);
   const commitMapBackground = useCallback((value: string) => {
     setMapBackgroundDraft(value);
     if (/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(value.trim())) {
@@ -220,29 +255,33 @@ export function PrintLayoutDialog({
     }
   }, []);
   // Native colorbar composed in the dialog (GH follow-up).
-  const [showColorbar, setShowColorbar] = useState(false);
-  const [colorbarRamp, setColorbarRamp] = useState("viridis");
-  const [colorbarMin, setColorbarMin] = useState("0");
-  const [colorbarMax, setColorbarMax] = useState("100");
-  const [colorbarLabel, setColorbarLabel] = useState("");
+  const [showColorbar, setShowColorbar] = useState(initialLayout.showColorbar);
+  const [colorbarRamp, setColorbarRamp] = useState(initialLayout.colorbarRamp);
+  const [colorbarMin, setColorbarMin] = useState(initialLayout.colorbarMin);
+  const [colorbarMax, setColorbarMax] = useState(initialLayout.colorbarMax);
+  const [colorbarLabel, setColorbarLabel] = useState(initialLayout.colorbarLabel);
   const [colorbarOrientation, setColorbarOrientation] = useState<"vertical" | "horizontal">(
-    "vertical",
+    initialLayout.colorbarOrientation,
   );
   // Bar length as a percentage of the body width/height.
-  const [colorbarLength, setColorbarLength] = useState(34);
+  const [colorbarLength, setColorbarLength] = useState(initialLayout.colorbarLength);
   // User-defined legend composed in the dialog (like Controls -> Legend).
-  const [showCustomLegend, setShowCustomLegend] = useState(false);
-  const [customLegendTitle, setCustomLegendTitle] = useState("Legend");
+  const [showCustomLegend, setShowCustomLegend] = useState(initialLayout.showCustomLegend);
+  const [customLegendTitle, setCustomLegendTitle] = useState(initialLayout.customLegendTitle);
   const [customLegendEntries, setCustomLegendEntries] = useState<
     { id: string; label: string; color: string }[]
-  >([
-    { id: "cl-1", label: "Class 1", color: "#2563eb" },
-    { id: "cl-2", label: "Class 2", color: "#16a34a" },
-  ]);
+  >(initialLayout.customLegendEntries);
   const [customLegendPosition, setCustomLegendPosition] = useState<
     "top-left" | "top-right" | "bottom-left" | "bottom-right"
-  >("top-left");
-  const customLegendId = useRef(2);
+  >(initialLayout.customLegendPosition);
+  // Continue the id sequence past whatever the project restored, so a new
+  // swatch never collides with a saved one.
+  const customLegendId = useRef(
+    initialLayout.customLegendEntries.reduce((max, entry) => {
+      const parsed = Number(/^cl-(\d+)$/.exec(entry.id)?.[1]);
+      return Number.isFinite(parsed) && parsed > max ? parsed : max;
+    }, initialLayout.customLegendEntries.length),
+  );
   const [legendDict, setLegendDict] = useState("");
   const [legendDictError, setLegendDictError] = useState<string | null>(null);
 
@@ -275,55 +314,79 @@ export function PrintLayoutDialog({
   // Default away from the bottom-right nav duo and top-left legend.
   const [colorbarPosition, setColorbarPosition] = useState<
     "top-left" | "top-right" | "bottom-left" | "bottom-right"
-  >("top-right");
+  >(initialLayout.colorbarPosition);
   // Data blocks: attribute table + chart composed on the page (GH #1324).
-  const [showDataTable, setShowDataTable] = useState(false);
-  const [tableLayerId, setTableLayerId] = useState("");
-  const [tableTitle, setTableTitle] = useState("");
+  const [showDataTable, setShowDataTable] = useState(initialLayout.showDataTable);
+  const [tableLayerId, setTableLayerId] = useState(initialLayout.tableLayerId);
+  const [tableTitle, setTableTitle] = useState(initialLayout.tableTitle);
   // Explicitly checked columns; empty = the layer's first few fields.
-  const [tableColumns, setTableColumns] = useState<string[]>([]);
-  const [tableSortField, setTableSortField] = useState("");
-  const [tableSortDesc, setTableSortDesc] = useState(false);
-  const [tableMaxRows, setTableMaxRows] = useState(DEFAULT_TABLE_ROWS);
-  const [tablePosition, setTablePosition] = useState<BodyCorner>("bottom-left");
-  const [tableFilterToPage, setTableFilterToPage] = useState(true);
-  const [showDataChart, setShowDataChart] = useState(false);
-  const [chartLayerId, setChartLayerId] = useState("");
-  const [chartTitle, setChartTitle] = useState("");
-  const [chartType, setChartType] = useState<ChartBlockType>("bar");
-  const [chartCategoryField, setChartCategoryField] = useState("");
-  const [chartAggregation, setChartAggregation] = useState<BarAggregation>("count");
-  const [chartValueField, setChartValueField] = useState("");
+  const [tableColumns, setTableColumns] = useState<string[]>(initialLayout.tableColumns);
+  const [tableSortField, setTableSortField] = useState(initialLayout.tableSortField);
+  const [tableSortDesc, setTableSortDesc] = useState(initialLayout.tableSortDesc);
+  const [tableMaxRows, setTableMaxRows] = useState(initialLayout.tableMaxRows);
+  const [tableFitRows, setTableFitRows] = useState(initialLayout.tableFitRows);
+  const [tablePosition, setTablePosition] = useState<BodyCorner>(initialLayout.tablePosition);
+  const [tablePageFilter, setTablePageFilter] = useState<PageFilterMode>(
+    initialLayout.tablePageFilter,
+  );
+  const [tableFilterToAtlasFeature, setTableFilterToAtlasFeature] = useState(
+    initialLayout.tableFilterToAtlasFeature,
+  );
+  const [showDataChart, setShowDataChart] = useState(initialLayout.showDataChart);
+  const [chartLayerId, setChartLayerId] = useState(initialLayout.chartLayerId);
+  const [chartTitle, setChartTitle] = useState(initialLayout.chartTitle);
+  const [chartType, setChartType] = useState<ChartBlockType>(initialLayout.chartType);
+  const [chartCategoryField, setChartCategoryField] = useState(initialLayout.chartCategoryField);
+  const [chartAggregation, setChartAggregation] = useState<BarAggregation>(
+    initialLayout.chartAggregation,
+  );
+  const [chartValueField, setChartValueField] = useState(initialLayout.chartValueField);
   // Top-right by default: the scale bar + north arrow duo occupies the
   // bottom-right corner out of the box.
-  const [chartPosition, setChartPosition] = useState<BodyCorner>("top-right");
-  const [chartFilterToPage, setChartFilterToPage] = useState(true);
+  const [chartPosition, setChartPosition] = useState<BodyCorner>(initialLayout.chartPosition);
+  const [chartPageFilter, setChartPageFilter] = useState<PageFilterMode>(
+    initialLayout.chartPageFilter,
+  );
   // Cartographic title block ("stempel") fields (GH #522).
-  const [showInfoBlock, setShowInfoBlock] = useState(false);
-  const [author, setAuthor] = useState("");
-  const [projectNumber, setProjectNumber] = useState("");
-  const [crs, setCrs] = useState("");
-  const [revision, setRevision] = useState("");
+  const [showInfoBlock, setShowInfoBlock] = useState(initialLayout.showInfoBlock);
+  const [author, setAuthor] = useState(initialLayout.author);
+  const [projectNumber, setProjectNumber] = useState(initialLayout.projectNumber);
+  const [crs, setCrs] = useState(initialLayout.crs);
+  const [revision, setRevision] = useState(initialLayout.revision);
   // Custom print extent drawn on the map (GH #523).
-  const [captureMode, setCaptureMode] = useState<"viewport" | "extent">("viewport");
-  const [extentBbox, setExtentBbox] = useState<PrintExtent | null>(null);
+  const [captureMode, setCaptureMode] = useState<"viewport" | "extent">(initialLayout.captureMode);
+  const [extentBbox, setExtentBbox] = useState<PrintExtent | null>(initialLayout.extentBbox);
   const [drawingExtent, setDrawingExtent] = useState(false);
   // Atlas / map series: one page per coverage-layer feature (GH #1291).
-  const [atlasEnabled, setAtlasEnabled] = useState(false);
-  const [atlasLayerId, setAtlasLayerId] = useState("");
+  const renderer = useAppStore((state) => state.primaryRenderer);
+  const [atlasEnabledSetting, setAtlasEnabled] = useState(initialLayout.atlasEnabled);
+  // Atlas drives the live camera of a flat map (print-atlas-camera): a Style
+  // Spec map's own (a MapLibre or Mapbox globe included), or the engine's on
+  // a flat ArcGIS view; the ArcGIS SceneView and the Cesium globe have none.
+  const mapCapabilities = useMapCapabilities(mapControllerRef);
+  const projection = useAppStore((state) => state.preferences.map.projection);
+  const atlasRendererSupported =
+    mapCapabilities.flatProjection && (mapCapabilities.styleSpec || projection !== "globe");
+  const atlasEnabled = atlasEnabledSetting && atlasRendererSupported;
+  const [atlasLayerId, setAtlasLayerId] = useState(initialLayout.atlasLayerId);
   // Coverage strategy: one page per feature, or pages tiling the layer's line
   // features in fixed-length stretches (GH #1291 follow-up).
-  const [atlasCoverage, setAtlasCoverage] = useState<"features" | "line">("features");
-  const [atlasSegmentKm, setAtlasSegmentKm] = useState("20");
-  const [atlasNameField, setAtlasNameField] = useState("");
-  const [atlasExtentMode, setAtlasExtentMode] = useState<"margin" | "scale">("margin");
-  const [atlasMarginPct, setAtlasMarginPct] = useState(10);
-  const [atlasScale, setAtlasScale] = useState("50000");
-  const [atlasSortField, setAtlasSortField] = useState("");
-  const [atlasSortDescending, setAtlasSortDescending] = useState(false);
-  const [atlasFilter, setAtlasFilter] = useState("");
+  const [atlasCoverage, setAtlasCoverage] = useState<"features" | "line">(
+    initialLayout.atlasCoverage,
+  );
+  const [atlasSegmentKm, setAtlasSegmentKm] = useState(initialLayout.atlasSegmentKm);
+  const [atlasNameField, setAtlasNameField] = useState(initialLayout.atlasNameField);
+  const [atlasExtentMode, setAtlasExtentMode] = useState<"margin" | "scale">(
+    initialLayout.atlasExtentMode,
+  );
+  const [atlasMarginPct, setAtlasMarginPct] = useState(initialLayout.atlasMarginPct);
+  const [atlasMaskEnabled, setAtlasMaskEnabled] = useState(initialLayout.atlasMaskEnabled);
+  const [atlasScale, setAtlasScale] = useState(initialLayout.atlasScale);
+  const [atlasSortField, setAtlasSortField] = useState(initialLayout.atlasSortField);
+  const [atlasSortDescending, setAtlasSortDescending] = useState(initialLayout.atlasSortDescending);
+  const [atlasFilter, setAtlasFilter] = useState(initialLayout.atlasFilter);
   const [atlasFilenamePattern, setAtlasFilenamePattern] = useState(
-    "{atlas.pagenumber}-{atlas.name}",
+    initialLayout.atlasFilenamePattern,
   );
   const [atlasIndex, setAtlasIndex] = useState(0);
   // True while the atlas is driving the live map (stepping or exporting), so
@@ -499,7 +562,18 @@ export function PrintLayoutDialog({
     [],
   );
 
-  const baseLegend = useMemo(() => buildLegend(layers), [layers]);
+  const baseLegend = useMemo(
+    () =>
+      buildLegend(layers, {
+        labels: {
+          centroid: t("style.generator.typeCentroid"),
+          "bounding-box": t("style.generator.typeBoundingBox"),
+          "convex-hull": t("style.generator.typeConvexHull"),
+          buffer: t("style.generator.typeBuffer"),
+        },
+      }),
+    [layers, t],
+  );
   const legend = useMemo(
     () => applyLegendConfig(baseLegend, legendConfig),
     [baseLegend, legendConfig],
@@ -557,10 +631,27 @@ export function PrintLayoutDialog({
     [legendConfig, entryIdsInOrder, setLegendConfig],
   );
 
+  const captureRequest = useRef(0);
+  // The globe keeps the drawn extent as a native entity (MapLibre's box lives
+  // in the print-extent source/layers), so one retained disposer mirrors that
+  // box's show / hide-for-capture / clear lifecycle. No-op on MapLibre.
+  const enginePreviewRef = useRef<(() => void) | null>(null);
+  const showEnginePreview = useCallback(
+    (extent: PrintExtent | null) => {
+      enginePreviewRef.current?.();
+      enginePreviewRef.current = null;
+      const engine = mapControllerRef.current;
+      if (!extent || !engine || engine.getMap()) return;
+      enginePreviewRef.current = engine.showExtent(extent);
+    },
+    [mapControllerRef],
+  );
   const recapture = useCallback(
-    (clipOverride?: PrintExtent | null) => {
-      const map = mapControllerRef.current?.getMap();
-      if (!map) {
+    async (clipOverride?: PrintExtent | null) => {
+      const request = ++captureRequest.current;
+      const engine = mapControllerRef.current;
+      const map = engine?.getMap();
+      if (!engine?.getRenderSurface()) {
         setError(t("printLayout.errors.mapNotReady"));
         setCaptured(null);
         return;
@@ -569,7 +660,7 @@ export function PrintLayoutDialog({
       // it, so it must not fire later and overwrite the result (e.g. a viewport
       // recapture clobbering an extent the user drew while tiles were loading).
       if (idleRecaptureRef.current) {
-        map.off("idle", idleRecaptureRef.current);
+        map?.off("idle", idleRecaptureRef.current);
         idleRecaptureRef.current = null;
       }
       if (idleFallbackRef.current !== null) {
@@ -582,26 +673,36 @@ export function PrintLayoutDialog({
         clipOverride !== undefined ? clipOverride : captureMode === "extent" ? extentBbox : null;
       // An active graticule draws coordinate labels at the map edges; fit the
       // captured map with "contain" so the page crop does not trim them.
-      setMapFit(map.getLayer(GRATICULE_LABEL_LAYER_ID) ? "contain" : "cover");
+      setMapFit(map?.getLayer(GRATICULE_LABEL_LAYER_ID) ? "contain" : "cover");
       // Hide the extent box while reading the drawing buffer so its outline is
       // never baked into the captured image.
-      setPrintExtentVisible(map, false);
+      if (map) setPrintExtentVisible(map, false);
+      else showEnginePreview(null);
       try {
-        setCaptured(captureMapImage(map, clip));
+        const image = await captureEngineMapImage(engine, clip);
+        if (request !== captureRequest.current) return;
+        setCaptured(image);
         setError(null);
       } catch {
+        if (request !== captureRequest.current) return;
         setError(t("printLayout.errors.captureFailed"));
         setCaptured(null);
       } finally {
-        setPrintExtentVisible(map, true);
+        // Only the live request restores the box: a superseded capture's
+        // restore would otherwise land mid-way through the newer one and bake
+        // the outline into its image.
+        if (request === captureRequest.current) {
+          if (map && engine.getMap() === map) setPrintExtentVisible(map, true);
+          else if (!map) showEnginePreview(clipOverride !== undefined ? clipOverride : extentBbox);
+        }
       }
     },
-    [mapControllerRef, t, captureMode, extentBbox],
+    [mapControllerRef, t, captureMode, extentBbox, showEnginePreview],
   );
 
-  // Capture the map and seed defaults only on the closed -> open transition, so
-  // a background project-name change while the dialog is open does not replace
-  // the snapshot the user is composing.
+  // Capture the map only on the closed -> open transition, so a background
+  // change while the dialog is open does not replace the snapshot the user is
+  // composing.
   useEffect(() => {
     const map = mapControllerRef.current?.getMap();
     if (open && !wasOpenRef.current) {
@@ -618,21 +719,25 @@ export function PrintLayoutDialog({
         copiedTimeoutRef.current = null;
       }
       setCopied(false);
-      setTitle((prev) => prev || (projectName ?? "").trim());
-      setDateText((prev) => prev || new Date().toLocaleDateString());
       // Re-show a previously drawn extent box while composing.
       if (map && extentBbox) showPrintExtent(map, extentBbox);
+      else if (!map && extentBbox) showEnginePreview(extentBbox);
       // With an active atlas persisting from a prior session, skip the plain
       // viewport capture: the atlas auto-drive effect recaptures the current
       // page on this same transition, and the extra capture would flash an
       // incorrect preview first.
       if (!atlasActiveRef.current) recapture();
     } else if (!open && wasOpenRef.current && !drawingRef.current) {
+      captureRequest.current++;
       // Closing for good (not to draw): take the extent box off the map.
+      showEnginePreview(null);
       if (map) clearPrintExtent(map);
+      // The atlas mask is drawn on either 2D engine; see captureAtlasPage.
+      const styleMap = engineStyleMap(mapControllerRef.current);
+      if (styleMap) clearAtlasFeatureMask(styleMap);
     }
     wasOpenRef.current = open;
-  }, [open, projectName, recapture, mapControllerRef, extentBbox]);
+  }, [open, recapture, mapControllerRef, extentBbox, showEnginePreview]);
 
   // Clean up if the dialog unmounts: abort an in-progress draw (so its window
   // listeners are torn down and it does not setState on an unmounted component)
@@ -650,6 +755,10 @@ export function PrintLayoutDialog({
         window.clearTimeout(copiedTimeoutRef.current);
         copiedTimeoutRef.current = null;
       }
+      enginePreviewRef.current?.();
+      enginePreviewRef.current = null;
+      // An atlas capture still in flight must not bring the preview back.
+      wasOpenRef.current = false;
       const map = mapControllerRef.current?.getMap();
       if (map) {
         if (idleRecaptureRef.current) {
@@ -658,6 +767,8 @@ export function PrintLayoutDialog({
         }
         clearPrintExtent(map);
       }
+      const styleMap = engineStyleMap(mapControllerRef.current);
+      if (styleMap) clearAtlasFeatureMask(styleMap);
     },
     [mapControllerRef],
   );
@@ -667,9 +778,194 @@ export function PrintLayoutDialog({
     [isCustom, customWidth, customHeight, customUnit],
   );
 
-  const options = useMemo<LayoutOptions>(
+  // Everything the composer holds that describes the project's map document,
+  // in the shape the project file stores. The literal is checked against
+  // `PrintLayoutConfig` both ways: assigning these control values in, and the
+  // seeding above assigning them back out, so this and the storage contract in
+  // `@geolibre/core` cannot drift apart without failing the build.
+  const layoutConfig = useMemo<PrintLayoutConfig>(
     () => ({
       title,
+      subtitle,
+      titlePlacement,
+      titleAlign,
+      paperSize,
+      orientation,
+      customWidth,
+      customHeight,
+      customUnit,
+      pageMargin,
+      showPageBorder,
+      pageBorderColor,
+      pageBorderWidth,
+      mapBorderColor,
+      mapBorderWidth,
+      mapBackground,
+      showTitle,
+      showSubtitle,
+      showLegend,
+      showScaleBar,
+      showNorthArrow,
+      navigationGrouped,
+      showFooter,
+      footerText,
+      showDate,
+      dateText,
+      showAttribution,
+      showColorbar,
+      colorbarRamp,
+      colorbarMin,
+      colorbarMax,
+      colorbarLabel,
+      colorbarOrientation,
+      colorbarLength,
+      colorbarPosition,
+      showCustomLegend,
+      customLegendTitle,
+      customLegendEntries,
+      customLegendPosition,
+      showDataTable,
+      tableLayerId,
+      tableTitle,
+      tableColumns,
+      tableSortField,
+      tableSortDesc,
+      tableMaxRows,
+      tableFitRows,
+      tablePosition,
+      tablePageFilter,
+      tableFilterToAtlasFeature,
+      showDataChart,
+      chartLayerId,
+      chartTitle,
+      chartType,
+      chartCategoryField,
+      chartAggregation,
+      chartValueField,
+      chartPosition,
+      chartPageFilter,
+      showInfoBlock,
+      author,
+      projectNumber,
+      crs,
+      revision,
+      captureMode,
+      extentBbox,
+      atlasEnabled: atlasEnabledSetting,
+      atlasLayerId,
+      atlasCoverage,
+      atlasSegmentKm,
+      atlasNameField,
+      atlasExtentMode,
+      atlasMarginPct,
+      atlasMaskEnabled,
+      atlasScale,
+      atlasSortField,
+      atlasSortDescending,
+      atlasFilter,
+      atlasFilenamePattern,
+    }),
+    [
+      title,
+      subtitle,
+      titlePlacement,
+      titleAlign,
+      paperSize,
+      orientation,
+      customWidth,
+      customHeight,
+      customUnit,
+      pageMargin,
+      showPageBorder,
+      pageBorderColor,
+      pageBorderWidth,
+      mapBorderColor,
+      mapBorderWidth,
+      mapBackground,
+      showTitle,
+      showSubtitle,
+      showLegend,
+      showScaleBar,
+      showNorthArrow,
+      navigationGrouped,
+      showFooter,
+      footerText,
+      showDate,
+      dateText,
+      showAttribution,
+      showColorbar,
+      colorbarRamp,
+      colorbarMin,
+      colorbarMax,
+      colorbarLabel,
+      colorbarOrientation,
+      colorbarLength,
+      colorbarPosition,
+      showCustomLegend,
+      customLegendTitle,
+      customLegendEntries,
+      customLegendPosition,
+      showDataTable,
+      tableLayerId,
+      tableTitle,
+      tableColumns,
+      tableSortField,
+      tableSortDesc,
+      tableMaxRows,
+      tableFitRows,
+      tablePosition,
+      tablePageFilter,
+      tableFilterToAtlasFeature,
+      showDataChart,
+      chartLayerId,
+      chartTitle,
+      chartType,
+      chartCategoryField,
+      chartAggregation,
+      chartValueField,
+      chartPosition,
+      chartPageFilter,
+      showInfoBlock,
+      author,
+      projectNumber,
+      crs,
+      revision,
+      captureMode,
+      extentBbox,
+      atlasEnabledSetting,
+      atlasLayerId,
+      atlasCoverage,
+      atlasSegmentKm,
+      atlasNameField,
+      atlasExtentMode,
+      atlasMarginPct,
+      atlasMaskEnabled,
+      atlasScale,
+      atlasSortField,
+      atlasSortDescending,
+      atlasFilter,
+      atlasFilenamePattern,
+    ],
+  );
+
+  // Push composer edits into the project so Save writes them and reopening the
+  // project restores them. `setPrintLayout` ignores a config equal to the one
+  // already stored, so this effect's first run (which replays exactly what the
+  // controls were seeded with) does not mark the project dirty.
+  useEffect(() => {
+    setPrintLayout(layoutConfig);
+  }, [layoutConfig, setPrintLayout]);
+
+  // Blank title / date follow the project rather than being written into the
+  // controls: seeding them on open would edit the saved layout (and mark the
+  // project dirty) just because the composer was opened, and a title seeded
+  // once would go stale when the project is renamed.
+  const resolvedTitle = title.trim() ? title : (projectName ?? "").trim();
+  const resolvedDateText = dateText.trim() ? dateText : new Date().toLocaleDateString();
+
+  const options = useMemo<LayoutOptions>(
+    () => ({
+      title: resolvedTitle,
       subtitle,
       paperSize,
       orientation,
@@ -686,7 +982,7 @@ export function PrintLayoutDialog({
       showFooter,
       footerText,
       showDate,
-      dateText,
+      dateText: resolvedDateText,
       showAttribution,
       pageMargin,
       showPageBorder,
@@ -733,8 +1029,10 @@ export function PrintLayoutDialog({
       legend,
       legendTitle: legendConfig.title,
       legendGroupByLayer: legendConfig.groupByLayer,
+      legendFormatNote: (count: number) => t("printLayout.legend.moreItems", { count }),
       markerIcons,
       metersPerPixel: captured?.metersPerPixel ?? 0,
+      mapPixelRatio: captured?.pixelRatio ?? 1,
       bearingDeg: captured?.bearingDeg ?? 0,
       mapImage: captured?.image ?? null,
       mapImageWidth: captured?.width ?? 0,
@@ -742,7 +1040,7 @@ export function PrintLayoutDialog({
       mapFit,
     }),
     [
-      title,
+      resolvedTitle,
       subtitle,
       paperSize,
       orientation,
@@ -759,7 +1057,7 @@ export function PrintLayoutDialog({
       showFooter,
       footerText,
       showDate,
-      dateText,
+      resolvedDateText,
       showAttribution,
       pageMargin,
       showPageBorder,
@@ -879,6 +1177,22 @@ export function PrintLayoutDialog({
   const currentAtlasPage = atlasEnabled ? (atlasPages[clampedAtlasIndex] ?? null) : null;
   const atlasActive = atlasEnabled && atlasPageCount > 0;
   atlasActiveRef.current = atlasActive;
+  const currentAtlasFeature = currentAtlasPage
+    ? atlasLayer?.geojson?.features[currentAtlasPage.sourceIndex]
+    : undefined;
+  const atlasMaskAvailable = Boolean(
+    atlasCoverage === "features" &&
+    (currentAtlasFeature?.geometry?.type === "Polygon" ||
+      currentAtlasFeature?.geometry?.type === "MultiPolygon"),
+  );
+  // The mask is a temporary live-map layer. Remove it immediately when the
+  // option, atlas, or dialog is turned off instead of waiting for another
+  // camera drive that may never happen.
+  useEffect(() => {
+    if (open && atlasActive && atlasMaskEnabled && atlasMaskAvailable) return;
+    const map = engineStyleMap(mapControllerRef.current);
+    if (map) clearAtlasFeatureMask(map);
+  }, [open, atlasActive, atlasMaskEnabled, atlasMaskAvailable, mapControllerRef]);
   const atlasFilterValid = atlasFilterPredicate !== null;
   const atlasScaleValid = atlasExtentMode !== "scale" || Number(atlasScale) > 0;
   // A floor (not just > 0) keeps a mistyped tiny length from cutting a long
@@ -919,6 +1233,9 @@ export function PrintLayoutDialog({
     () => atlasLayers.find((l) => l.id === chartLayerId) ?? null,
     [atlasLayers, chartLayerId],
   );
+  const tableUsesAtlasLayer = Boolean(
+    atlasEnabled && atlasLayer && tableLayer?.id === atlasLayer.id,
+  );
   const tableFields = useMemo(
     () => (tableLayer?.geojson ? listAtlasFields(tableLayer.geojson.features) : []),
     [tableLayer],
@@ -931,10 +1248,14 @@ export function PrintLayoutDialog({
     () => (tableLayer?.geojson ? layerRows(tableLayer.geojson) : []),
     [tableLayer],
   );
-  const chartAllRows = useMemo(
-    () => (chartLayer?.geojson ? layerRows(chartLayer.geojson) : []),
-    [chartLayer],
-  );
+  const chartAllRows = useMemo(() => {
+    if (!chartLayer?.geojson) return [];
+    // GeoJSON properties can also encode measurements as strings (for
+    // example, data exported from a GIS form or database). Analyze a guarded
+    // copy so those fields remain available as chart values without mutating
+    // the layer or converting identifiers and leading-zero codes.
+    return coerceNumericStringRows(layerRows(chartLayer.geojson));
+  }, [chartLayer]);
   // Per-feature bounds for the page-extent filter, walked once per layer so
   // stepping/exporting an N-page atlas does not redo the vertex walk N times
   // (the same precompute pattern the atlas page builder uses).
@@ -946,18 +1267,14 @@ export function PrintLayoutDialog({
     () => (chartLayer?.geojson ? collectAtlasFeatures(chartLayer.geojson) : []),
     [chartLayer],
   );
-  const chartCategoricalFields = useMemo(
-    () => categoricalColumns(chartAllRows, chartFields),
+  const chartCategoryOptions = useMemo(
+    () => categoryColumnOptions(chartAllRows, chartFields),
     [chartAllRows, chartFields],
   );
   const chartNumericFields = useMemo(
     () => numericColumns(chartAllRows, chartFields),
     [chartAllRows, chartFields],
   );
-  // Category options prefer detected low-cardinality fields but fall back to
-  // every field, so an unusual layer can still be charted.
-  const chartCategoryOptions =
-    chartCategoricalFields.length > 0 ? chartCategoricalFields : chartFields;
   // Effective selections: the first suitable field stands in until the user
   // picks one, so enabling a block gives instant feedback.
   const effectiveCategoryField =
@@ -1003,9 +1320,14 @@ export function PrintLayoutDialog({
     (
       features: readonly AtlasFeatureInfo[],
       allRows: ChartRow[],
-      filterOn: boolean,
+      filterMode: PageFilterMode,
       bounds: AtlasBounds | null,
-    ): ChartRow[] => (filterOn && bounds ? rowsWithinBounds(features, bounds) : allRows),
+    ): ChartRow[] => {
+      if (!bounds || filterMode === "all") return allRows;
+      return filterMode === "contained"
+        ? rowsWithinBounds(features, bounds)
+        : rowsIntersectingBounds(features, bounds);
+    },
     [],
   );
 
@@ -1024,7 +1346,7 @@ export function PrintLayoutDialog({
           columns: effectiveTableColumns,
           sortField: tableSortField || undefined,
           sortDescending: tableSortDesc,
-          maxRows: tableMaxRows,
+          maxRows: tableFitRows ? MAX_TABLE_ROWS : tableMaxRows,
         });
         if (data) {
           dataTable = {
@@ -1064,6 +1386,7 @@ export function PrintLayoutDialog({
       tableSortField,
       tableSortDesc,
       tableMaxRows,
+      tableFitRows,
       tableTitle,
       tablePosition,
       showDataChart,
@@ -1091,28 +1414,35 @@ export function PrintLayoutDialog({
   const displayTableRows = useMemo(
     () =>
       showDataTable
-        ? rowsForBlock(tableFeatureInfos, tableAllRows, tableFilterToPage, displayFilterBounds)
+        ? tableFilterToAtlasFeature && tableUsesAtlasLayer
+          ? currentAtlasPage
+            ? rowForAtlasFeature(tableAllRows, currentAtlasPage.sourceIndex)
+            : []
+          : rowsForBlock(tableFeatureInfos, tableAllRows, tablePageFilter, displayFilterBounds)
         : [],
     [
       showDataTable,
       rowsForBlock,
       tableFeatureInfos,
       tableAllRows,
-      tableFilterToPage,
+      tablePageFilter,
+      tableFilterToAtlasFeature,
+      tableUsesAtlasLayer,
+      currentAtlasPage,
       displayFilterBounds,
     ],
   );
   const displayChartRows = useMemo(
     () =>
       showDataChart
-        ? rowsForBlock(chartFeatureInfos, chartAllRows, chartFilterToPage, displayFilterBounds)
+        ? rowsForBlock(chartFeatureInfos, chartAllRows, chartPageFilter, displayFilterBounds)
         : [],
     [
       showDataChart,
       rowsForBlock,
       chartFeatureInfos,
       chartAllRows,
-      chartFilterToPage,
+      chartPageFilter,
       displayFilterBounds,
     ],
   );
@@ -1136,115 +1466,161 @@ export function PrintLayoutDialog({
       : withBlocks;
   }, [options, displayDataBlocks, atlasTokenCtx]);
 
-  /** Resolve once the map goes idle after an atlas camera move, with a grace
-   * timeout because browsers may throttle the occluded canvas behind the
-   * dialog and delay "idle" indefinitely (same failure mode as GH #743);
-   * captureMapImage forces a redraw, so proceeding is safe. */
-  const waitForAtlasSettle = useCallback(
-    (map: NonNullable<ReturnType<MapController["getMap"]>>) =>
-      new Promise<void>((resolve) => {
-        let done = false;
-        let timer = 0;
-        const finish = () => {
-          if (done) return;
-          done = true;
-          map.off("idle", finish);
-          window.clearTimeout(timer);
-          resolve();
-        };
-        map.on("idle", finish);
-        timer = window.setTimeout(finish, 2500);
-      }),
-    [],
-  );
-
   // Drive the live map to one atlas page's extent and capture it. Margin mode
   // grows the feature's box before fitting; fixed-scale mode fits first, then
   // corrects the zoom by the log2 ratio difference (like applyScale) and
-  // recaptures. Returns the capture plus the map's final visible bounds, so
-  // the data blocks can filter to what the page actually shows.
+  // recaptures. Returns the capture plus the print frame's final visible
+  // bounds, so data blocks exclude the part of the live map that cover-crop
+  // removes from the page.
   const captureAtlasPage = useCallback(
-    async (page: AtlasPage): Promise<{ cap: CapturedMap; viewBounds: AtlasBounds }> => {
-      const map = mapControllerRef.current?.getMap();
-      if (!map) throw new Error("Map is not ready");
-      const [w, s, e, n] = expandBounds(page.bounds, atlasFitMarginPct);
-      map.fitBounds(
-        [
-          [w, s],
-          [e, n],
-        ],
-        { animate: false, padding: 0 },
-      );
-      await waitForAtlasSettle(map);
+    async (
+      page: AtlasPage,
+    ): Promise<{
+      cap: CapturedMap;
+      viewBounds: AtlasBounds;
+      mapFit: "cover" | "contain";
+    }> => {
+      // Atlas drives the live camera, on any flat map: the Style Spec map's
+      // own camera, or the engine's (see print-atlas-camera).
+      const engine = mapControllerRef.current;
+      const camera = atlasCamera(engine, GRATICULE_LABEL_LAYER_ID);
+      if (!engine || !camera) throw new Error("Map is not ready");
+      const ctx: AtlasTokenContext = {
+        name: page.name,
+        pageNumber: page.index + 1,
+        total: atlasPageCount,
+        properties: page.properties,
+      };
+      const pageOptions: LayoutOptions = {
+        ...options,
+        title: substituteAtlasTokens(options.title, ctx),
+        subtitle: substituteAtlasTokens(options.subtitle, ctx),
+        footerText: substituteAtlasTokens(options.footerText, ctx),
+      };
+      const { containMap, canvas, pixelRatio: cssPixelRatio } = camera;
+      const viewportWidth = canvas.clientWidth || canvas.width / cssPixelRatio;
+      const viewportHeight = canvas.clientHeight || canvas.height / cssPixelRatio;
+      const targetAspect = containMap
+        ? viewportWidth / Math.max(1, viewportHeight)
+        : mapBodyAspectRatio(pageOptions);
+      const viewportFrame = atlasViewportFrame(viewportWidth, viewportHeight, targetAspect);
+      const coverageFeature = atlasLayer?.geojson?.features[page.sourceIndex];
+      camera.showMask(atlasMaskEnabled ? coverageFeature : undefined);
+      await camera.fit(expandBounds(page.bounds, atlasFitMarginPct), viewportFrame.padding);
+      await camera.settle();
       // Mirror recapture: an active graticule draws coordinate labels at the
       // map edges, so fit with "contain" to keep them un-cropped on every
       // atlas page (mapFit is persistent state, so it must be set here too).
-      setMapFit(map.getLayer(GRATICULE_LABEL_LAYER_ID) ? "contain" : "cover");
+      const atlasMapFit = containMap ? "contain" : "cover";
+      setMapFit(atlasMapFit);
       // Hide the drawn print-extent box while reading the buffer, as recapture
       // does, so its outline is never baked into a page.
-      const capture = () => {
-        setPrintExtentVisible(map, false);
+      const nativeMap = engine.getMap();
+      const capture = async () => {
+        if (!nativeMap) {
+          // Another engine draws the box as its own preview; capture through
+          // the engine, as recapture does there.
+          showEnginePreview(null);
+          try {
+            return await captureEngineMapImage(engine, null, camera.decorate);
+          } finally {
+            // The drawn box stays on the map as a reference in either capture
+            // mode, as the MapLibre branch and recapture restore it, but only
+            // on this dialog's engine: a capture that outlived a close or a
+            // renderer change must not draw on whatever replaced it.
+            if (wasOpenRef.current && mapControllerRef.current === engine)
+              showEnginePreview(extentBbox);
+          }
+        }
+        setPrintExtentVisible(nativeMap, false);
         try {
-          return captureMapImage(map, null);
+          return captureMapImage(nativeMap, null);
         } finally {
-          setPrintExtentVisible(map, true);
+          setPrintExtentVisible(nativeMap, true);
         }
       };
-      let cap = capture();
+      let cap = await capture();
       if (atlasExtentMode === "scale") {
         const target = Number(atlasScale);
         // Measure against the page's substituted text, not the raw templates:
         // a title/footer made purely of tokens can resolve to empty for a
         // given feature, which collapses that row and changes the body height
         // the scale is computed from.
-        const ctx: AtlasTokenContext = {
-          name: page.name,
-          pageNumber: page.index + 1,
-          total: atlasPageCount,
-          properties: page.properties,
-        };
-        const ratio = computeScaleRatio({
-          ...options,
-          title: substituteAtlasTokens(options.title, ctx),
-          subtitle: substituteAtlasTokens(options.subtitle, ctx),
-          footerText: substituteAtlasTokens(options.footerText, ctx),
-          metersPerPixel: cap.metersPerPixel,
-          bearingDeg: cap.bearingDeg,
-          mapImage: cap.image,
-          mapImageWidth: cap.width,
-          mapImageHeight: cap.height,
-        });
-        if (target > 0 && ratio > 0) {
-          const zoom = map.getZoom() + Math.log2(ratio / target);
-          const clamped = Math.max(map.getMinZoom(), Math.min(map.getMaxZoom(), zoom));
+        const measure = () =>
+          computeScaleRatio({
+            ...pageOptions,
+            metersPerPixel: cap.metersPerPixel,
+            mapPixelRatio: cap.pixelRatio,
+            bearingDeg: cap.bearingDeg,
+            mapImage: cap.image,
+            mapImageWidth: cap.width,
+            mapImageHeight: cap.height,
+          });
+        // MapLibre lands on the scale in one correction; another engine's
+        // camera can round the zoom it is given (the ArcGIS SDK does), so the
+        // scale is measured again and corrected up to twice more.
+        // Up to three corrections; the last pass only measures the capture
+        // that ships, so the notice reflects it.
+        for (let attempt = 0; attempt < 4; attempt++) {
+          const ratio = measure();
+          if (!(target > 0 && ratio > 0)) break;
+          if (attempt > 0 && Math.abs(ratio / target - 1) < 0.005) {
+            // Landed: an earlier pass's out-of-range notice no longer holds.
+            setAtlasScaleNotice(null);
+            break;
+          }
+          // Still off after every correction: the camera cannot reach the scale
+          // (a zoom limit, or bounds that raise the minimum), so say so.
+          if (attempt === 3) {
+            setAtlasScaleNotice(t("printLayout.errors.scaleOutOfRange"));
+            break;
+          }
+          const zoom = camera.zoom() + Math.log2(ratio / target);
+          const clamped = Math.max(camera.minZoom(), Math.min(camera.maxZoom(), zoom));
           // A clamp means this page renders at the closest reachable scale,
           // not the requested one: surface that (like applyScale's notice)
           // instead of letting the substitution pass silently.
           setAtlasScaleNotice(
             Math.abs(clamped - zoom) > 1e-3 ? t("printLayout.errors.scaleOutOfRange") : null,
           );
-          if (Math.abs(clamped - map.getZoom()) > 1e-3) {
-            map.setZoom(clamped);
-            await waitForAtlasSettle(map);
-            cap = capture();
-          }
+          if (Math.abs(clamped - camera.zoom()) <= 1e-3) break;
+          await camera.setZoom(clamped);
+          await camera.settle();
+          cap = await capture();
         }
       } else {
         setAtlasScaleNotice(null);
       }
-      const b = map.getBounds();
+      const frameBounds = containMap
+        ? null
+        : geometryBounds({
+            type: "MultiPoint",
+            coordinates: [
+              [viewportFrame.crop.left, viewportFrame.crop.top],
+              [viewportFrame.crop.right, viewportFrame.crop.top],
+              [viewportFrame.crop.right, viewportFrame.crop.bottom],
+              [viewportFrame.crop.left, viewportFrame.crop.bottom],
+            ]
+              .map(([x, y]) => camera.unproject(x, y))
+              // A frame corner off the globe has no position.
+              .filter((point): point is [number, number] => point !== null),
+          });
       return {
         cap,
-        viewBounds: [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()],
+        viewBounds: frameBounds ?? camera.bounds(),
+        mapFit: atlasMapFit,
       };
     },
     [
       mapControllerRef,
+      extentBbox,
+      showEnginePreview,
       atlasExtentMode,
       atlasFitMarginPct,
       atlasScale,
       atlasPageCount,
-      waitForAtlasSettle,
+      atlasLayer,
+      atlasMaskEnabled,
       options,
       t,
     ],
@@ -1278,35 +1654,42 @@ export function PrintLayoutDialog({
   // switched on without one selected, or when the selected layer disappears
   // (e.g. removed from the Layers panel while the dialog is open) — a stale
   // id would leave the Select valueless and the series silently empty.
+  //
+  // Gated on `open` like the auto-drive effect below: the dialog stays mounted
+  // when closed, and since the composer's settings are now project state, an
+  // ungated reassignment would rewrite (and dirty) the saved layout in the
+  // background when a layer is deleted from the Layers panel, with the
+  // composer never opened. Reopening it re-runs this and defaults then.
   useEffect(() => {
-    if (!atlasEnabled || atlasLayers.length === 0) return;
+    if (!open || !atlasEnabled || atlasLayers.length === 0) return;
     if (!atlasLayers.some((l) => l.id === atlasLayerId)) {
       setAtlasLayerId(atlasLayers[0].id);
       setAtlasNameField("");
       setAtlasSortField("");
       setAtlasIndex(0);
     }
-  }, [atlasEnabled, atlasLayerId, atlasLayers]);
+  }, [open, atlasEnabled, atlasLayerId, atlasLayers]);
 
-  // Same defaulting for the data blocks' layers (GH #1324): fill in the first
-  // eligible layer when a block is enabled without one, or when its selected
-  // layer disappears; the field choices belong to the old layer, so drop them.
+  // Same defaulting (and the same `open` gate) for the data blocks' layers
+  // (GH #1324): fill in the first eligible layer when a block is enabled
+  // without one, or when its selected layer disappears; the field choices
+  // belong to the old layer, so drop them.
   useEffect(() => {
-    if (!showDataTable || atlasLayers.length === 0) return;
+    if (!open || !showDataTable || atlasLayers.length === 0) return;
     if (!atlasLayers.some((l) => l.id === tableLayerId)) {
       setTableLayerId(atlasLayers[0].id);
       setTableColumns([]);
       setTableSortField("");
     }
-  }, [showDataTable, tableLayerId, atlasLayers]);
+  }, [open, showDataTable, tableLayerId, atlasLayers]);
   useEffect(() => {
-    if (!showDataChart || atlasLayers.length === 0) return;
+    if (!open || !showDataChart || atlasLayers.length === 0) return;
     if (!atlasLayers.some((l) => l.id === chartLayerId)) {
       setChartLayerId(atlasLayers[0].id);
       setChartCategoryField("");
       setChartValueField("");
     }
-  }, [showDataChart, chartLayerId, atlasLayers]);
+  }, [open, showDataChart, chartLayerId, atlasLayers]);
 
   // Latest page index for the auto-drive effect below, so stepping (which
   // sets the index) does not itself re-trigger a capture.
@@ -1337,6 +1720,7 @@ export function PrintLayoutDialog({
     atlasExtentMode,
     atlasMarginPct,
     atlasScale,
+    atlasMaskEnabled,
     // Along-a-line coverage: a new segment length can keep the same page
     // count (sourceIndex signature unchanged) while every extent moved.
     atlasCoverage,
@@ -1345,9 +1729,15 @@ export function PrintLayoutDialog({
 
   // Fixed scale is only meaningful on physical paper (like the manual scale
   // input); fall back to margin mode when the page switches to pixel sizes.
+  // `open`-gated for the same reason as the defaulting effects above: this also
+  // runs on the mount that every project load triggers, so a hand-edited file
+  // pairing a pixel page with scale mode would be corrected — and the project
+  // marked dirty — before the composer had ever been opened. Nothing acts on
+  // the pairing until the composer is open, and opening it runs this.
   useEffect(() => {
+    if (!open) return;
     if (!isMmPage && atlasExtentMode === "scale") setAtlasExtentMode("margin");
-  }, [isMmPage, atlasExtentMode]);
+  }, [open, isMmPage, atlasExtentMode]);
 
   // Two-way scale sync: reflect the captured view's scale into the input unless
   // the user is actively editing it.
@@ -1366,22 +1756,45 @@ export function PrintLayoutDialog({
   const scaleEditable = Boolean(captured) && captureMode !== "extent";
   const applyScale = useCallback(
     (targetRatio: number) => {
-      const map = mapControllerRef.current?.getMap();
-      if (captureMode === "extent" || !map || !(targetRatio > 0) || !(currentRatio > 0)) {
+      const engine = mapControllerRef.current;
+      const map = engine?.getMap();
+      if (engine && !map && captureMode !== "extent") {
+        // `applyMapPreferences` feeds a non-MapLibre engine the project's zoom
+        // limits (clamped to [0, 24], the range every engine accepts), so those
+        // are what this camera can reach.
+        const target = scaleZoomTarget(
+          engine.readView().zoom,
+          currentRatio,
+          targetRatio,
+          clamp(prefMinZoom, 0, 24),
+          clamp(prefMaxZoom, 0, 24),
+        );
+        if (!target) return;
+        // A scale the camera cannot reach is applied partially, so say so rather
+        // than letting the value snap back unexplained — the same contract the
+        // MapLibre branch below has had since GH #743.
+        setScaleNotice(target.clamped ? t("printLayout.errors.scaleOutOfRange") : null);
+        // Already there (or clamped to where it is): recapture without moving,
+        // so the reported scale still refreshes.
+        if (!target.unchanged) engine.flyTo({ zoom: target.zoom, duration: 0 });
+        void recapture(null);
         return;
       }
-      const newZoom = map.getZoom() + Math.log2(currentRatio / targetRatio);
-      // Clamp to the map's own zoom limits (not a fixed 0–24) so the out-of-range
-      // notice reflects what this map can actually reach.
-      const minZoom = map.getMinZoom();
-      const maxZoom = map.getMaxZoom();
-      const clampedZoom = Math.max(minZoom, Math.min(maxZoom, newZoom));
+      if (captureMode === "extent" || !map) return;
+      // The map's own zoom limits (not a fixed 0–24), so the out-of-range notice
+      // reflects what this map can actually reach.
+      const target = scaleZoomTarget(
+        map.getZoom(),
+        currentRatio,
+        targetRatio,
+        map.getMinZoom(),
+        map.getMaxZoom(),
+      );
+      if (!target) return;
       // The requested scale needs a zoom past the map's limits, so it can only be
       // applied partially: surface that instead of letting the value snap back
       // with no explanation (GH #743). A reachable scale clears the notice.
-      setScaleNotice(
-        Math.abs(clampedZoom - newZoom) > 1e-3 ? t("printLayout.errors.scaleOutOfRange") : null,
-      );
+      setScaleNotice(target.clamped ? t("printLayout.errors.scaleOutOfRange") : null);
       // Drop a still-pending idle handler / fallback timer from a prior applyScale
       // before registering new ones, so two quick scale changes don't both fire.
       if (idleRecaptureRef.current) {
@@ -1395,11 +1808,11 @@ export function PrintLayoutDialog({
       // No effective zoom change (already at target, or clamped): MapLibre won't
       // emit an "idle", so recapture directly rather than registering a handler
       // that would never fire and could later fire on an unrelated render.
-      if (Math.abs(clampedZoom - map.getZoom()) < 1e-6) {
+      if (target.unchanged) {
         recapture(null);
         return;
       }
-      map.setZoom(clampedZoom);
+      map.setZoom(target.zoom);
       // Recapture once the map is idle, so tiles for the new zoom have finished
       // loading and the snapshot is not blurry/blank mid-fetch. applyScale only
       // runs in viewport mode, so pin the recapture to a null clip. Use map.on
@@ -1430,14 +1843,15 @@ export function PrintLayoutDialog({
         }
       }, 1500);
     },
-    [mapControllerRef, captureMode, currentRatio, recapture, t],
+    [mapControllerRef, captureMode, currentRatio, prefMaxZoom, prefMinZoom, recapture, t],
   );
 
   // Hide the dialog so the map is interactive, let the user drag an extent box,
   // then reopen with the new extent active.
   const handleDrawExtent = useCallback(async () => {
-    const map = mapControllerRef.current?.getMap();
-    if (!map) return;
+    const engine = mapControllerRef.current;
+    if (!engine) return;
+    const map = engine.getMap();
     const page = resolvePageSize(options);
     const aspect = page.width / page.height;
     const controller = new AbortController();
@@ -1446,10 +1860,20 @@ export function PrintLayoutDialog({
     setDrawingExtent(true);
     onOpenChange(false);
     try {
-      const extent = await drawPrintExtent(map, {
-        aspect,
-        signal: controller.signal,
-      });
+      let extent: PrintExtent | null = null;
+      if (map) {
+        extent = await drawPrintExtent(map, { aspect, signal: controller.signal });
+      } else {
+        // Take the prior globe box down first so the drag is not painted over
+        // it (drawPrintExtent replaces the MapLibre box's data the same way).
+        showEnginePreview(null);
+        const drawn = await drawEnginePrintExtent(engine, controller.signal);
+        if (drawn && controller.signal.aborted) drawn.dispose();
+        else if (drawn) {
+          extent = drawn.extent;
+          enginePreviewRef.current = drawn.dispose;
+        }
+      }
       // Aborted means the dialog unmounted mid-draw: do not touch state.
       if (controller.signal.aborted) return;
       if (extent) {
@@ -1458,9 +1882,10 @@ export function PrintLayoutDialog({
         recapture(extent);
       } else if (extentBbox) {
         // Cancelled drag: drop the half-drawn preview back to the prior extent.
-        showPrintExtent(map, extentBbox);
+        if (map) showPrintExtent(map, extentBbox);
+        else showEnginePreview(extentBbox);
       } else {
-        clearPrintExtent(map);
+        if (map) clearPrintExtent(map);
       }
     } finally {
       if (drawAbortRef.current === controller) drawAbortRef.current = null;
@@ -1470,15 +1895,16 @@ export function PrintLayoutDialog({
         onOpenChange(true);
       }
     }
-  }, [mapControllerRef, options, onOpenChange, recapture, extentBbox]);
+  }, [mapControllerRef, options, onOpenChange, recapture, extentBbox, showEnginePreview]);
 
   const handleClearExtent = useCallback(() => {
     const map = mapControllerRef.current?.getMap();
     if (map) clearPrintExtent(map);
+    showEnginePreview(null);
     setExtentBbox(null);
     setCaptureMode("viewport");
     recapture(null);
-  }, [mapControllerRef, recapture]);
+  }, [mapControllerRef, recapture, showEnginePreview]);
 
   const setMode = useCallback(
     (mode: "viewport" | "extent") => {
@@ -1576,7 +2002,7 @@ export function PrintLayoutDialog({
     }
   };
 
-  const handleExport = async (kind: "png" | "pdf") => {
+  const handleExport = async (kind: "png" | "pdf" | "svg") => {
     if (!captured) {
       setError(t("printLayout.errors.captureFirst"));
       return;
@@ -1587,6 +2013,8 @@ export function PrintLayoutDialog({
       const base = sanitizeFilename(displayOptions.title || projectName || "map-layout");
       if (kind === "png") {
         await exportLayoutPng(displayOptions, `${base}.png`);
+      } else if (kind === "svg") {
+        await exportLayoutSvg(displayOptions, `${base}.svg`);
       } else {
         await exportLayoutPdf(displayOptions, `${base}.pdf`);
       }
@@ -1621,7 +2049,7 @@ export function PrintLayoutDialog({
         onProgress: (current: number, totalPages: number) =>
           setAtlasProgress({ current, total: totalPages }),
         optionsForPage: async (i: number): Promise<LayoutOptions> => {
-          const { cap, viewBounds } = await captureAtlasPage(pages[i]);
+          const { cap, viewBounds, mapFit: atlasMapFit } = await captureAtlasPage(pages[i]);
           // Mirror progress into the dialog preview as pages are produced.
           setCaptured(cap);
           setAtlasViewBounds({ index: i, bounds: viewBounds });
@@ -1632,17 +2060,21 @@ export function PrintLayoutDialog({
             // Each page's table/chart re-filters to the extent the page's
             // capture actually shows (not just the nominal feature bounds).
             ...buildBlocksFromRows(
-              rowsForBlock(tableFeatureInfos, tableAllRows, tableFilterToPage, viewBounds),
-              rowsForBlock(chartFeatureInfos, chartAllRows, chartFilterToPage, viewBounds),
+              tableFilterToAtlasFeature && tableUsesAtlasLayer
+                ? rowForAtlasFeature(tableAllRows, pages[i].sourceIndex)
+                : rowsForBlock(tableFeatureInfos, tableAllRows, tablePageFilter, viewBounds),
+              rowsForBlock(chartFeatureInfos, chartAllRows, chartPageFilter, viewBounds),
             ),
             title: substituteAtlasTokens(options.title, ctx),
             subtitle: substituteAtlasTokens(options.subtitle, ctx),
             footerText: substituteAtlasTokens(options.footerText, ctx),
             metersPerPixel: cap.metersPerPixel,
+            mapPixelRatio: cap.pixelRatio,
             bearingDeg: cap.bearingDeg,
             mapImage: cap.image,
             mapImageWidth: cap.width,
             mapImageHeight: cap.height,
+            mapFit: atlasMapFit,
           };
         },
       };
@@ -1670,8 +2102,16 @@ export function PrintLayoutDialog({
     }
   };
 
+  const handleDialogOpenChange = useCallback(
+    (nextOpen: boolean) => {
+      if (!nextOpen && (atlasBusy || exporting)) return;
+      onOpenChange(nextOpen);
+    },
+    [atlasBusy, exporting, onOpenChange],
+  );
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleDialogOpenChange}>
       <DialogContent
         ref={dialogRef}
         className="max-w-5xl"
@@ -1733,7 +2173,7 @@ export function PrintLayoutDialog({
                 id="layout-title"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                placeholder={t("printLayout.titlePlaceholder")}
+                placeholder={(projectName ?? "").trim() || t("printLayout.titlePlaceholder")}
               />
             </div>
             <div className="space-y-1.5">
@@ -2007,7 +2447,9 @@ export function PrintLayoutDialog({
                   </Button>
                 </div>
               )}
-              <p className="text-xs text-muted-foreground">{t("printLayout.extent.hint")}</p>
+              <p className="text-xs text-muted-foreground">
+                {t(renderer === "cesium" ? "rasterSubset.drawHint" : "printLayout.extent.hint")}
+              </p>
             </div>
 
             <Separator />
@@ -2019,7 +2461,7 @@ export function PrintLayoutDialog({
                 id="atlas-enabled"
                 label={t("printLayout.atlas.enable")}
                 checked={atlasEnabled}
-                disabled={atlasBusy}
+                disabled={atlasBusy || !atlasRendererSupported}
                 onChange={(next) => {
                   setAtlasEnabled(next);
                   // Start the series from its first page on (re-)enable.
@@ -2185,6 +2627,20 @@ export function PrintLayoutDialog({
                           {atlasScaleValid && atlasScaleNotice && (
                             <p className="text-xs text-destructive">{atlasScaleNotice}</p>
                           )}
+                        </div>
+                      )}
+                      {atlasMaskAvailable && (
+                        <div className="space-y-1.5">
+                          <ToggleField
+                            id="atlas-mask-outside"
+                            label={t("printLayout.atlas.maskOutside")}
+                            checked={atlasMaskEnabled}
+                            disabled={atlasBusy}
+                            onChange={setAtlasMaskEnabled}
+                          />
+                          <p className="text-xs text-muted-foreground">
+                            {t("printLayout.atlas.maskOutsideHint")}
+                          </p>
                         </div>
                       )}
                       {/* Along-a-line pages follow the line's own chainage,
@@ -2672,6 +3128,7 @@ export function PrintLayoutDialog({
                           min={1}
                           max={MAX_TABLE_ROWS}
                           value={tableMaxRows}
+                          disabled={tableFitRows}
                           onChange={(e) =>
                             setTableMaxRows(
                               Math.max(1, Math.min(MAX_TABLE_ROWS, Number(e.target.value) || 1)),
@@ -2698,14 +3155,47 @@ export function PrintLayoutDialog({
                       </div>
                     </div>
                     <ToggleField
-                      id="dt-filter-page"
-                      label={t("printLayout.dataBlocks.filterToPage")}
-                      checked={tableFilterToPage}
-                      onChange={setTableFilterToPage}
+                      id="dt-fit-rows"
+                      label={t("printLayout.dataTable.fitRows")}
+                      checked={tableFitRows}
+                      onChange={setTableFitRows}
                     />
+                    <div className="space-y-1.5">
+                      <Label htmlFor="dt-filter-page">
+                        {t("printLayout.dataBlocks.pageFilter")}
+                      </Label>
+                      <Select
+                        id="dt-filter-page"
+                        value={tablePageFilter}
+                        disabled={tableFilterToAtlasFeature && tableUsesAtlasLayer}
+                        onChange={(e) => setTablePageFilter(e.target.value as PageFilterMode)}
+                      >
+                        <option value="all">{t("printLayout.dataBlocks.filterAll")}</option>
+                        <option value="contained">
+                          {t("printLayout.dataBlocks.filterContained")}
+                        </option>
+                        <option value="intersecting">
+                          {t("printLayout.dataBlocks.filterIntersecting")}
+                        </option>
+                      </Select>
+                    </div>
                     <p className="text-xs text-muted-foreground">
                       {t("printLayout.dataBlocks.filterToPageHint")}
                     </p>
+                    {atlasEnabled && (
+                      <>
+                        <ToggleField
+                          id="dt-filter-atlas-feature"
+                          label={t("printLayout.dataBlocks.filterToAtlasFeature")}
+                          checked={tableFilterToAtlasFeature}
+                          disabled={!tableUsesAtlasLayer}
+                          onChange={setTableFilterToAtlasFeature}
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          {t("printLayout.dataBlocks.filterToAtlasFeatureHint")}
+                        </p>
+                      </>
+                    )}
                     {!displayDataBlocks.dataTable && (
                       <p className="text-xs text-muted-foreground">
                         {t("printLayout.dataTable.noRows")}
@@ -2838,12 +3328,24 @@ export function PrintLayoutDialog({
                         onChange={(e) => setChartTitle(e.target.value)}
                       />
                     </div>
-                    <ToggleField
-                      id="dc-filter-page"
-                      label={t("printLayout.dataBlocks.filterToPage")}
-                      checked={chartFilterToPage}
-                      onChange={setChartFilterToPage}
-                    />
+                    <div className="space-y-1.5">
+                      <Label htmlFor="dc-filter-page">
+                        {t("printLayout.dataBlocks.pageFilter")}
+                      </Label>
+                      <Select
+                        id="dc-filter-page"
+                        value={chartPageFilter}
+                        onChange={(e) => setChartPageFilter(e.target.value as PageFilterMode)}
+                      >
+                        <option value="all">{t("printLayout.dataBlocks.filterAll")}</option>
+                        <option value="contained">
+                          {t("printLayout.dataBlocks.filterContained")}
+                        </option>
+                        <option value="intersecting">
+                          {t("printLayout.dataBlocks.filterIntersecting")}
+                        </option>
+                      </Select>
+                    </div>
                     <p className="text-xs text-muted-foreground">
                       {t("printLayout.dataBlocks.filterToPageHint")}
                     </p>
@@ -3024,7 +3526,9 @@ export function PrintLayoutDialog({
                                     // encodeURIComponent, which leaves ( ) unescaped, and an
                                     // unquoted ) (common in SVG: translate(), rgba(), url(#id))
                                     // would prematurely close the CSS url() token.
-                                    style={{ backgroundImage: `url("${svgSrc}")` }}
+                                    style={{
+                                      backgroundImage: `url("${svgSrc}")`,
+                                    }}
                                   />
                                 );
                               }
@@ -3186,7 +3690,7 @@ export function PrintLayoutDialog({
           </div>
         </div>
 
-        <div className="flex items-center justify-end gap-2 pt-2">
+        <div className="flex flex-wrap items-center justify-end gap-2 pt-2">
           {/* Atlas export progress, kept visible next to the buttons. */}
           {atlasProgress && (
             <span className="me-auto text-sm text-muted-foreground">
@@ -3196,7 +3700,11 @@ export function PrintLayoutDialog({
               })}
             </span>
           )}
-          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+          <Button
+            variant="ghost"
+            disabled={atlasBusy || exporting}
+            onClick={() => handleDialogOpenChange(false)}
+          >
             {t("common.close")}
           </Button>
           {/* Copy the composed layout straight to the clipboard (GH #773). */}
@@ -3212,6 +3720,16 @@ export function PrintLayoutDialog({
             )}
             {copied ? t("printLayout.copied") : t("printLayout.copyToClipboard")}
           </Button>
+          {!atlasEnabled && (
+            <Button
+              variant="outline"
+              disabled={exporting || atlasBusy || !captured}
+              onClick={() => void handleExport("svg")}
+            >
+              <FileImage className="me-2 h-4 w-4" />
+              {t("printLayout.exportSvg")}
+            </Button>
+          )}
           {/* Equal-weight export buttons: neither format is the "primary" one
               (GH #520). In atlas mode they become the whole-series exports:
               a zip of per-page PNGs and one multi-page PDF (GH #1291). */}

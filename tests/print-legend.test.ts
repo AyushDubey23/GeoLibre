@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  DEFAULT_LAYER_STYLE,
   DEFAULT_LEGEND_CONFIG,
   type GeoLibreLayer,
   type LayerStyle,
@@ -10,10 +11,12 @@ import {
   applyLegendConfig,
   buildLegend,
   legendEditorRows,
+  MAX_CATEGORY_SWATCHES,
   reorderLegendEntry,
   setLegendItemLabel,
   toggleLegendItemHidden,
 } from "../apps/geolibre-desktop/src/lib/print-legend";
+import { MAX_LEGEND_ROWS } from "../apps/geolibre-desktop/src/lib/auto-legend";
 
 function config(overrides: Partial<LegendConfig> = {}): LegendConfig {
   return { ...DEFAULT_LEGEND_CONFIG, order: [], overrides: {}, ...overrides };
@@ -32,6 +35,166 @@ function makeLayer(overrides: Partial<GeoLibreLayer>): GeoLibreLayer {
     ...overrides,
   } as unknown as GeoLibreLayer;
 }
+
+function polygonGeojson(): NonNullable<GeoLibreLayer["geojson"]> {
+  return {
+    type: "FeatureCollection",
+    features: [
+      {
+        type: "Feature",
+        properties: { count: 10 },
+        geometry: {
+          type: "Polygon",
+          coordinates: [
+            [
+              [0, 0],
+              [1, 0],
+              [1, 1],
+              [0, 1],
+              [0, 0],
+            ],
+          ],
+        },
+      },
+    ],
+  };
+}
+
+describe("buildLegend geometry generators", () => {
+  it("lists a fixed-size generated centroid after the parent geometry", () => {
+    const [entry] = buildLegend([
+      makeLayer({
+        name: "Regions",
+        geojson: polygonGeojson(),
+        metadata: { geometryType: "polygon" },
+        style: {
+          ...DEFAULT_LAYER_STYLE,
+          geometryGenerator: "centroid",
+          geometryGeneratorFillColor: "#f59e0b",
+          geometryGeneratorCircleRadius: 7,
+        },
+      }),
+    ]);
+
+    assert.deepEqual(entry.swatches, [
+      { color: DEFAULT_LAYER_STYLE.fillColor, label: "Regions" },
+      { color: "#f59e0b", label: "Centroids", size: 7 },
+    ]);
+  });
+
+  it("lists an attribute-sized generated centroid ramp with localized labels", () => {
+    const [entry] = buildLegend(
+      [
+        makeLayer({
+          geojson: polygonGeojson(),
+          metadata: { geometryType: "polygon" },
+          style: {
+            ...DEFAULT_LAYER_STYLE,
+            geometryGenerator: "centroid",
+            geometryGeneratorFillColor: "#ef4444",
+            geometryGeneratorSizeProperty: "count",
+            geometryGeneratorSizeMinValue: 0,
+            geometryGeneratorSizeMaxValue: 100,
+            geometryGeneratorSizeMinRadius: 4,
+            geometryGeneratorSizeMaxRadius: 24,
+          },
+        }),
+      ],
+      { labels: { centroid: "Centroides" } },
+    );
+
+    assert.deepEqual(
+      entry.swatches.slice(1).map((swatch) => [swatch.label, swatch.size, swatch.color]),
+      [
+        ["Centroides (count): 0", 4, "#ef4444"],
+        ["Centroides (count): 50", 14, "#ef4444"],
+        ["Centroides (count): 100", 24, "#ef4444"],
+      ],
+    );
+  });
+
+  it("lists generated polygon types and omits renderer-suppressed generators", () => {
+    for (const [geometryGenerator, expectedLabel] of [
+      ["bounding-box", "Bounding boxes"],
+      ["convex-hull", "Convex hulls"],
+      ["buffer", "Buffers"],
+    ] as const) {
+      const [entry] = buildLegend([
+        makeLayer({
+          geojson: polygonGeojson(),
+          metadata: { geometryType: "polygon" },
+          style: {
+            ...DEFAULT_LAYER_STYLE,
+            geometryGenerator,
+            geometryGeneratorFillColor: "#22c55e",
+          },
+        }),
+      ]);
+      assert.deepEqual(entry.swatches.at(-1), {
+        color: "#22c55e",
+        label: expectedLabel,
+      });
+    }
+
+    const base = makeLayer({
+      geojson: polygonGeojson(),
+      metadata: { geometryType: "polygon" },
+      style: { ...DEFAULT_LAYER_STYLE, geometryGenerator: "centroid" },
+    });
+    for (const candidate of [
+      { ...base, style: { ...base.style, extrusionEnabled: true } },
+      { ...base, timeFilter: ["==", ["get", "year"], 2026] },
+      { ...base, embedFilter: ["==", ["get", "kind"], "active"] },
+      { ...base, metadata: { ...base.metadata, externalDeckLayer: true } },
+      { ...base, metadata: { ...base.metadata, nativeLayerIds: ["external-fill"] } },
+      {
+        ...base,
+        metadata: {
+          ...base.metadata,
+          sourceKind: "maplibre-gl-vector",
+          customLayerType: "fill",
+          nativeLayerIds: [],
+        },
+      },
+      {
+        ...base,
+        style: {
+          ...base.style,
+          geometryGenerator: "buffer" as const,
+          geometryGeneratorBufferDistance: 0,
+          geometryGeneratorBufferProperty: "",
+        },
+      },
+      {
+        ...base,
+        style: {
+          ...base.style,
+          vectorStyleMode: "rule-based" as const,
+          vectorRules: [
+            {
+              id: "active",
+              label: "Active",
+              filter: '["==", ["get", "kind"], "active"]',
+              color: "#22c55e",
+              isElse: false,
+            },
+            {
+              id: "else",
+              label: "Other",
+              filter: "",
+              color: "#94a3b8",
+              isElse: true,
+              enabled: false,
+            },
+          ],
+        },
+      },
+    ]) {
+      const [entry] = buildLegend([candidate]);
+      assert.equal(entry.swatches.length, 1);
+    }
+  });
+});
 
 describe("buildLegend rule-based swatches", () => {
   it("lists drawable rules plus the else rule, skipping disabled and group rules", () => {
@@ -195,6 +358,64 @@ describe("buildLegend", () => {
     ]);
     assert.equal(legend[0].swatches[0].color, "#112233");
     assert.equal(legend[0].swatches[0].marker, undefined);
+  });
+
+  it("draws a marker layer's proportional size ramp with the marker", () => {
+    const svg = "https://example.com/bee.svg";
+    const legend = buildLegend([
+      makeLayer({
+        name: "Ruchers",
+        metadata: { geometryType: "point" },
+        style: {
+          vectorStyleMode: "single",
+          fillColor: "#3388ff",
+          markerEnabled: true,
+          markerShape: "custom",
+          markerColor: "#3b82f6",
+          markerSvg: svg,
+          proportionalSizeEnabled: true,
+          proportionalSizeProperty: "nb_ruches",
+          proportionalSizeMinValue: 1,
+          proportionalSizeMaxValue: 86,
+          proportionalSizeMinRadius: 4,
+          proportionalSizeMaxRadius: 24,
+        } as LayerStyle,
+      }),
+    ]);
+    // Three sized rows, each carrying the marker the map scales through
+    // icon-size, rather than a plain circle (GH discussion #1711).
+    assert.deepEqual(
+      legend[0].swatches.map((swatch) => [swatch.size, swatch.marker?.shape, swatch.marker?.svg]),
+      [
+        [4, "custom", svg],
+        [14, "custom", svg],
+        [24, "custom", svg],
+      ],
+    );
+  });
+
+  it("keeps a line layer's proportional stroke ramp markerless", () => {
+    const legend = buildLegend([
+      makeLayer({
+        name: "Rivers",
+        metadata: { geometryType: "line" },
+        style: {
+          vectorStyleMode: "single",
+          fillColor: "#3388ff",
+          markerEnabled: true,
+          markerShape: "star",
+          markerColor: "#ff8800",
+          proportionalSizeEnabled: true,
+          proportionalSizeProperty: "flow",
+          proportionalSizeMinValue: 0,
+          proportionalSizeMaxValue: 100,
+          proportionalSizeMinRadius: 1,
+          proportionalSizeMaxRadius: 8,
+        } as LayerStyle,
+      }),
+    ]);
+    assert.equal(legend[0].swatches.length, 3);
+    assert.ok(legend[0].swatches.every((swatch) => swatch.marker === undefined));
   });
 
   it("leaves non-marker layers with a plain fill swatch and no marker", () => {
@@ -425,9 +646,28 @@ describe("buildLegend", () => {
     });
   });
 
-  it("caps ramp swatches at six samples", () => {
+  it("caps graduated ramp swatches at six samples", () => {
     const stops = Array.from({ length: 12 }, (_, i) => ({
       value: i,
+      color: `#0000${(i % 10).toString()}0`,
+    }));
+    const legend = buildLegend([
+      makeLayer({
+        name: "Many",
+        style: {
+          vectorStyleMode: "graduated",
+          vectorStyleStops: stops,
+        } as LayerStyle,
+      }),
+    ]);
+    assert.equal(legend[0].swatches.length, 6);
+  });
+
+  it("lists every categorized class rather than sampling six (GH #1608)", () => {
+    // Categories are nominal, so a sampled subset silently drops values the
+    // reader has no way to infer from the rows that survive.
+    const stops = Array.from({ length: 14 }, (_, i) => ({
+      value: `class-${i.toString()}`,
       color: `#0000${(i % 10).toString()}0`,
     }));
     const legend = buildLegend([
@@ -439,7 +679,37 @@ describe("buildLegend", () => {
         } as LayerStyle,
       }),
     ]);
-    assert.equal(legend[0].swatches.length, 6);
+    assert.equal(legend[0].swatches.length, 14);
+    assert.deepEqual(
+      legend[0].swatches.map((s) => s.label),
+      stops.map((s) => s.value),
+    );
+  });
+
+  it("elides categorized classes at the same point as the on-map auto legend", () => {
+    // print-legend cannot import auto-legend (auto-legend imports print-legend),
+    // so the cap is a hand-kept copy. If the two drift, the printed legend and
+    // the on-map legend silently disagree about where a long class list stops.
+    assert.equal(MAX_CATEGORY_SWATCHES, MAX_LEGEND_ROWS);
+  });
+
+  it("elides the tail of a runaway categorized class list", () => {
+    const stops = Array.from({ length: 140 }, (_, i) => ({
+      value: `class-${i.toString()}`,
+      color: "#000000",
+    }));
+    const legend = buildLegend([
+      makeLayer({
+        name: "Runaway",
+        style: {
+          vectorStyleMode: "categorized",
+          vectorStyleStops: stops,
+        } as LayerStyle,
+      }),
+    ]);
+    assert.equal(legend[0].swatches.length, 100);
+    assert.equal(legend[0].swatches[0].label, "class-0");
+    assert.equal(legend[0].swatches[99].label, "class-99");
   });
 
   it("gives raster and service layers a single neutral swatch", () => {
@@ -670,5 +940,126 @@ describe("legend config mutations", () => {
   it("ignores a move past the ends", () => {
     const unchanged = reorderLegendEntry(config(), ["top", "bottom"], "top", "up");
     assert.deepEqual(unchanged.order, []);
+  });
+});
+
+describe("buildLegend proportional size", () => {
+  it("emits a three-step size ramp for a point layer with proportional sizing", () => {
+    const legend = buildLegend([
+      makeLayer({
+        id: "apiaries",
+        name: "Apiaries",
+        metadata: { geometryType: "point" },
+        style: {
+          vectorStyleMode: "single",
+          fillColor: "#3b82f6",
+          proportionalSizeEnabled: true,
+          proportionalSizeProperty: "nb_ruches",
+          proportionalSizeMinValue: 2,
+          proportionalSizeMaxValue: 48,
+          proportionalSizeMinRadius: 4,
+          proportionalSizeMaxRadius: 24,
+        } as unknown as LayerStyle,
+      }),
+    ]);
+    assert.equal(legend.length, 1);
+    assert.deepEqual(
+      legend[0].swatches.map((swatch) => [swatch.label, swatch.size, swatch.color]),
+      [
+        ["2", 4, "#3b82f6"],
+        ["25", 14, "#3b82f6"],
+        ["48", 24, "#3b82f6"],
+      ],
+    );
+  });
+
+  it("omits the size ramp for polygon layers", () => {
+    const legend = buildLegend([
+      makeLayer({
+        id: "zones",
+        name: "Zones",
+        metadata: { geometryType: "polygon" },
+        style: {
+          vectorStyleMode: "single",
+          fillColor: "#22c55e",
+          proportionalSizeEnabled: true,
+          proportionalSizeProperty: "area",
+          proportionalSizeMinValue: 0,
+          proportionalSizeMaxValue: 100,
+          proportionalSizeMinRadius: 4,
+          proportionalSizeMaxRadius: 24,
+        } as unknown as LayerStyle,
+      }),
+    ]);
+    assert.deepEqual(legend[0].swatches, [{ color: "#22c55e" }]);
+  });
+
+  it("preserves sizes through applyLegendConfig", () => {
+    const base = buildLegend([
+      makeLayer({
+        id: "pts",
+        name: "Points",
+        metadata: { geometryType: "point" },
+        style: {
+          vectorStyleMode: "single",
+          fillColor: "#111111",
+          proportionalSizeEnabled: true,
+          proportionalSizeProperty: "pop",
+          proportionalSizeMinValue: 0,
+          proportionalSizeMaxValue: 100,
+          proportionalSizeMinRadius: 4,
+          proportionalSizeMaxRadius: 12,
+        } as unknown as LayerStyle,
+      }),
+    ]);
+    const applied = applyLegendConfig(base, config());
+    assert.deepEqual(
+      applied[0].swatches.map((swatch) => swatch.size),
+      [4, 8, 12],
+    );
+  });
+
+  it("pairs sampled graduated colors with sizes from the same displayed stops", () => {
+    // More than MAX_RAMP_SWATCHES (6) classes: sampling must keep each
+    // displayed color/label paired with the size for that same stop, not an
+    // index into the unsampled list.
+    const stops = Array.from({ length: 10 }, (_, index) => ({
+      value: index * 10,
+      color: `#${(index * 25).toString(16).padStart(2, "0")}0000`,
+    }));
+    const legend = buildLegend([
+      makeLayer({
+        id: "many",
+        name: "Many classes",
+        metadata: { geometryType: "point" },
+        style: {
+          vectorStyleMode: "graduated",
+          vectorStyleProperty: "pop",
+          vectorStyleStops: stops,
+          fillColor: "#ffffff",
+          proportionalSizeEnabled: true,
+          proportionalSizeProperty: "pop",
+          proportionalSizeMinValue: 0,
+          proportionalSizeMaxValue: 90,
+          proportionalSizeMinRadius: 4,
+          proportionalSizeMaxRadius: 22,
+        } as unknown as LayerStyle,
+      }),
+    ]);
+    assert.equal(legend[0].swatches.length, 6);
+    // Even sample of 10 → values 0,20,40,50,70,90. Sizes use midpoints between
+    // consecutive displayed stops (open-ended top class at its lower bound).
+    const sizeAt = (value: number) => 4 + (value / 90) * 18;
+    assert.deepEqual(
+      legend[0].swatches.map((swatch) => [swatch.label, swatch.size]),
+      [
+        ["≥ 0", sizeAt(10)],
+        ["≥ 20", sizeAt(30)],
+        ["≥ 40", sizeAt(45)],
+        ["≥ 50", sizeAt(60)],
+        ["≥ 70", sizeAt(80)],
+        ["≥ 90", sizeAt(90)],
+      ],
+    );
   });
 });

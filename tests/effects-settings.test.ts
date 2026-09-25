@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { DECK_CANVAS_CLASS } from "maplibre-gl-lidar";
 import {
   DEFAULT_EFFECTS_SETTINGS,
   HALO_EXTENT_MAX,
   HALO_EXTENT_MIN,
   HALO_OPACITY_MAX,
   HALO_OPACITY_MIN,
+  effectsOverlayCss,
+  nextEffectsFrameTime,
   normalizeEffectsSettings,
 } from "../packages/plugins/src/plugins/maplibre-effects";
 
@@ -62,5 +65,48 @@ describe("normalizeEffectsSettings", () => {
     assert.equal(result.haloColor, "#111111");
     assert.equal(result.spaceColor, "#222222");
     assert.equal(result.haloOpacity, 0.5);
+  });
+});
+
+describe("nextEffectsFrameTime", () => {
+  it("keeps decorative frames one 60 FPS interval apart on high-refresh displays", () => {
+    let lastFrameTime = -Infinity;
+    const renderedAt: number[] = [];
+
+    for (let index = 0; index < 180; index += 1) {
+      const timestamp = index * (1000 / 90);
+      const nextFrameTime = nextEffectsFrameTime(timestamp, lastFrameTime);
+      if (nextFrameTime === null) continue;
+      renderedAt.push(nextFrameTime);
+      lastFrameTime = nextFrameTime;
+    }
+
+    assert.equal(renderedAt.length, 90);
+    for (let index = 1; index < renderedAt.length; index += 1) {
+      assert.ok(renderedAt[index] - renderedAt[index - 1] + 0.1 >= 1000 / 60);
+    }
+  });
+});
+
+describe("effectsOverlayCss", () => {
+  it("keeps the LiDAR point-cloud canvas above the basemap but below markers", () => {
+    const css = effectsOverlayCss();
+    const zIndexFor = (selector: string) => {
+      const rule = css.split("}").find((block) => block.includes(`.${selector}`));
+      assert.ok(rule, `no rule for .${selector}`);
+      const zIndex = /z-index:\s*(\d+)/.exec(rule);
+      assert.ok(zIndex, `no z-index for .${selector}`);
+      return Number(zIndex[1]);
+    };
+
+    // The deck.gl canvas the LiDAR plugin parks after the map canvas shares the
+    // canvas's z-index, so DOM order puts it above the basemap; markers (and
+    // the control container, which matches them) stay above the points. See
+    // opengeos/GeoLibre#2530. The selector is read from the class the package
+    // itself exports, so a rename upstream fails here instead of silently
+    // un-fixing the stacking.
+    const lidarCanvas = zIndexFor(DECK_CANVAS_CLASS);
+    const marker = zIndexFor("maplibregl-marker");
+    assert.ok(lidarCanvas < marker, `${lidarCanvas} should be below ${marker}`);
   });
 });

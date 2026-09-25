@@ -1,9 +1,20 @@
 /**
- * Pure helpers shared by the Add Data dialog sources: layer construction,
- * URL building, parsing/validation, and PostgreSQL connection persistence.
+ * Helpers shared by the Add Data dialog sources: layer construction, URL
+ * building, parsing/validation, and PostgreSQL connection persistence.
+ *
+ * All of them are pure except {@link createBaseLayer}, which reads the project's
+ * current layers so a new vector layer can pick a color none of them is using.
  */
 
-import { DEFAULT_LAYER_STYLE, type GeoLibreLayer } from "@geolibre/core";
+import {
+  localFileName,
+  DEFAULT_LAYER_STYLE,
+  type GeoLibreLayer,
+  hasSimpleStyleProperties,
+  initialLayerStyle,
+  type LayerStyle,
+  useAppStore,
+} from "@geolibre/core";
 import type { FeatureCollection } from "geojson";
 import type { TFunction } from "i18next";
 import { classifyFetchFailure } from "../../../lib/fetch-error";
@@ -25,7 +36,7 @@ export function createLayerId(): string {
 }
 
 export function fileNameFromPath(path: string): string {
-  return path.split(/[/\\]/).pop() ?? path;
+  return localFileName(path);
 }
 
 export function layerNameFromPath(path: string, fallback: string): string {
@@ -60,11 +71,58 @@ export function normalizeCrs(raw: string): string {
   return value.toUpperCase();
 }
 
+/**
+ * The vector data a layer being built will carry, so {@link createBaseLayer} can
+ * style it the way `addGeoJsonLayer` styles one.
+ */
+export interface BaseLayerVectorOptions {
+  /**
+   * The collection the layer will render. Supplying it opts the layer into the
+   * as-added vector styling of #1519: its own palette color plus sizes chosen
+   * for the geometry it actually contains. Sources with no collection to paint
+   * from — rasters, tile services, video — leave it unset and keep the flat
+   * schema defaults, so nothing draws a palette color it would never paint with.
+   */
+  geojson?: FeatureCollection;
+  /**
+   * Layers built earlier in the same submit but not yet added to the store. A
+   * multi-layer import (a GPX with tracks *and* waypoints) would otherwise hand
+   * every group the same first free palette entry, since the store does not
+   * learn about any of them until they are all added.
+   */
+  pendingLayers?: readonly GeoLibreLayer[];
+}
+
+/** The style a new layer starts with, given whatever vector data it carries. */
+function initialStyleFor(vector: BaseLayerVectorOptions): LayerStyle {
+  const { geojson, pendingLayers } = vector;
+  if (!geojson) return { ...DEFAULT_LAYER_STYLE };
+  const projectLayers = useAppStore.getState().layers;
+  return initialLayerStyle({
+    geojson,
+    layers: pendingLayers?.length ? [...projectLayers, ...pendingLayers] : projectLayers,
+    overrides: { simpleStyleEnabled: hasSimpleStyleProperties(geojson) },
+  });
+}
+
+/**
+ * Builds the common {@link GeoLibreLayer} shell every Add Data source starts
+ * from.
+ *
+ * @param name - The layer name shown in the layer list.
+ * @param type - The layer type.
+ * @param source - The source descriptor persisted with the project.
+ * @param metadata - Source-specific metadata.
+ * @param vector - The data a vector layer will carry; see
+ *   {@link BaseLayerVectorOptions}. Omit it for non-vector layers.
+ * @returns The constructed layer.
+ */
 export function createBaseLayer(
   name: string,
   type: GeoLibreLayer["type"],
   source: Record<string, unknown>,
   metadata: Record<string, unknown> = {},
+  vector: BaseLayerVectorOptions = {},
 ): GeoLibreLayer {
   return {
     id: createLayerId(),
@@ -73,7 +131,7 @@ export function createBaseLayer(
     source,
     visible: true,
     opacity: 1,
-    style: { ...DEFAULT_LAYER_STYLE },
+    style: initialStyleFor(vector),
     metadata,
   };
 }
@@ -276,20 +334,25 @@ export function proxyFeedRequestUrl(url: string): string {
  * cross-origin restrictions that block a plain browser fetch of a WMS/WFS host
  * that omits CORS headers:
  * - Desktop (Tauri): fetched natively through the `fetch_url_bytes` command,
- *   which runs in Rust and is not subject to browser CORS, so any service works.
- * - Dev server (Vite): routed through the same-origin dev proxy.
- * - Hosted web build: a direct fetch, which only succeeds when the service
- *   sends `Access-Control-Allow-Origin`.
+ *   which runs in Rust and is not subject to browser CORS.
+ * - Dev server (Vite): absolute HTTP(S) URLs use the same-origin dev proxy;
+ *   relative URLs are fetched directly from the app's origin.
+ * - Hosted web build: a direct fetch. Cross-origin services must send
+ *   `Access-Control-Allow-Origin`; same-origin ones need none.
  *
- * @param requestUrl - The absolute GetCapabilities request URL.
+ * @param requestUrl - The GetCapabilities request URL, absolute or relative.
  * @param devProxyPath - The dev-server proxy path to use under Vite.
  * @param signal - Optional abort signal.
+ * @param maxBytes - Optional response ceiling, enforced while the body is read
+ *   in both branches. Callers that supply one get a rejection whose message
+ *   carries "download limit" from whichever branch ran.
  * @returns The response ok flag, status, and body text.
  */
-async function fetchCapabilitiesText(
+export async function fetchCapabilitiesText(
   requestUrl: string,
   devProxyPath: string,
   signal?: AbortSignal,
+  maxBytes?: number,
 ): Promise<{ ok: boolean; status: number; text: string }> {
   if (isTauri()) {
     // `fetch_url_bytes` rejects on a non-2xx status, so a resolved value is OK.
@@ -302,6 +365,7 @@ async function fetchCapabilitiesText(
     const abort = signal ? AbortSignal.any([signal, timeout]) : timeout;
     const bytesPromise = fetchUrlBytes(requestUrl, {
       context: "OGC GetCapabilities",
+      ...(maxBytes === undefined ? {} : { maxBytes }),
     });
     // If the abort/timeout wins the race, the native call is left unobserved;
     // swallow its later rejection so it does not surface as an unhandled
@@ -318,9 +382,10 @@ async function fetchCapabilitiesText(
       throw error;
     }
   }
-  const fetchUrl = isViteDevServer()
-    ? `${devProxyPath}?url=${encodeURIComponent(requestUrl)}`
-    : requestUrl;
+  const fetchUrl =
+    isViteDevServer() && /^https?:\/\//i.test(requestUrl)
+      ? `${devProxyPath}?url=${encodeURIComponent(requestUrl)}`
+      : requestUrl;
   let response: Response;
   try {
     response = await fetch(fetchUrl, {
@@ -341,13 +406,55 @@ async function fetchCapabilitiesText(
     }
     throw error;
   }
-  const buffer = new Uint8Array(await response.arrayBuffer());
+  const buffer =
+    maxBytes === undefined
+      ? new Uint8Array(await response.arrayBuffer())
+      : await readLimitedBody(response, maxBytes);
   const charset = charsetFromContentType(response.headers.get("content-type"));
   return {
     ok: response.ok,
     status: response.status,
     text: decodeXmlBytes(buffer, charset),
   };
+}
+
+/**
+ * Reads a response body, refusing one that runs past `maxBytes`. Mirrors the
+ * native `read_limited_body` helper, message included, so a capped fetch fails
+ * the same way in both builds: the advertised length is rejected before a byte
+ * is read, and the stream is counted as it arrives rather than buffered whole
+ * and measured afterwards.
+ */
+export async function readLimitedBody(
+  response: Response,
+  maxBytes: number,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const tooLarge = () => new Error(`Response exceeds the ${maxBytes}-byte download limit`);
+  if (Number(response.headers.get("content-length")) > maxBytes) throw tooLarge();
+  const reader = response.body?.getReader();
+  // A bodyless response (an empty 204, a stubbed fetch) has nothing to stream;
+  // `arrayBuffer` resolves it without reading past the ceiling.
+  if (!reader) return new Uint8Array(await response.arrayBuffer());
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) throw tooLarge();
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 /**
@@ -390,6 +497,32 @@ function decodeXmlBytes(bytes: Uint8Array, httpCharset?: string): string {
 /** Extracts the `charset` from a `Content-Type` header value, if any. */
 function charsetFromContentType(contentType: string | null): string | undefined {
   return contentType?.match(/charset=["']?([\w-]+)/i)?.[1];
+}
+
+/**
+ * Whether a service form value is a usable endpoint: an absolute HTTP(S) URL or
+ * a same-origin reference (root-relative `/wms` or route-relative `geoserver/wms`).
+ * Relative endpoints are how reverse-proxied deployments (e.g. GeoServer behind
+ * the app origin) express their services. Protocol-relative URLs (`//host/x`)
+ * are deliberately refused here — they are cross-origin, not same-origin — as
+ * are all scheme-bearing values that are not HTTP(S): javascript:, data:, ftp:
+ * and friends are never service endpoints.
+ */
+export function isServiceFormUrl(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed || /\s/.test(trimmed)) return false;
+  if (trimmed.startsWith("//")) return false;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)) {
+    if (!/^https?:\/\//i.test(trimmed)) return false;
+    try {
+      // "https://" has a scheme but no host: reject scheme-only values here
+      // instead of letting new URL() throw down in the request builders.
+      return new URL(trimmed).hostname !== "";
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**

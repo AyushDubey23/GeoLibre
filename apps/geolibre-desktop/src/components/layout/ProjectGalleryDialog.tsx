@@ -16,6 +16,7 @@ import {
   ImageOff,
   Loader2,
   Lock,
+  LogIn,
   Search,
   Star,
   User,
@@ -30,14 +31,25 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { useDesktopSettingsStore } from "../../hooks/useDesktopSettings";
+import { observeGalleryEnd } from "../../lib/gallery-auto-load";
 import { openExternalLink } from "../../lib/open-external";
+import {
+  getShareAccessToken,
+  ShareOAuthError,
+  shareOAuthErrorKey,
+  signInToShare,
+  supportsShareOAuth,
+  useShareOAuthStore,
+} from "../../lib/share-oauth";
 import {
   fetchMyProjects,
   fetchSharedProjects,
   GalleryError,
+  type GalleryErrorCode,
   projectOpenToken,
   type SharedProject,
 } from "../../lib/share-gallery";
+import { shareHostLabel } from "../../lib/share-geolibre";
 import type { TFunction } from "i18next";
 
 type GalleryScope = "featured" | "all" | "mine";
@@ -51,7 +63,11 @@ interface ProjectGalleryDialogProps {
    * authorizes the fetch. Resolves on success and rejects with a descriptive
    * error the dialog surfaces inline.
    */
-  onOpenProject: (rawJsonUrl: string, authToken?: string) => Promise<void>;
+  onOpenProject: (
+    rawJsonUrl: string,
+    authToken?: string,
+    options?: { asCopy?: boolean },
+  ) => Promise<void>;
 }
 
 // Page size for each listing request. The endpoint paginates by limit + offset.
@@ -65,21 +81,27 @@ function searchHaystack(project: SharedProject): string {
 /**
  * Translate a fetch error into a localized message. The gallery library throws
  * coded {@link GalleryError}s (it can't call `t()`); the UI maps each code to a
- * catalog string here.
+ * catalog string here. Web builds name the OAuth session in the unauthorized
+ * case, since that is the credential the web sign-in produced.
  */
-function galleryErrorMessage(error: unknown, t: TFunction): string {
+function galleryErrorMessage(error: unknown, t: TFunction, oauthSupported: boolean): string {
+  if (error instanceof ShareOAuthError) return t(shareOAuthErrorKey(error.code));
   if (error instanceof GalleryError) {
     switch (error.code) {
       case "timeout":
         return t("gallery.errorTimeout");
       case "network":
-        return t("gallery.errorNetwork");
+        return t("gallery.errorNetwork", { shareHost: shareHostLabel() });
       case "invalid-response":
         return t("gallery.errorInvalidResponse");
       case "unauthorized":
-        return t("gallery.errorUnauthorized");
+        return oauthSupported
+          ? t("gallery.errorUnauthorizedOAuth", { shareHost: shareHostLabel() })
+          : t("gallery.errorUnauthorized", { shareHost: shareHostLabel() });
       case "username-required":
-        return t("gallery.errorUsernameRequired");
+        return t("gallery.errorUsernameRequired", { shareHost: shareHostLabel() });
+      case "not-configured":
+        return t("gallery.errorNotConfigured");
       case "http":
         return t("gallery.errorHttp", { status: error.status ?? 0 });
     }
@@ -88,11 +110,12 @@ function galleryErrorMessage(error: unknown, t: TFunction): string {
 }
 
 /**
- * Browse public projects shared on share.geolibre.app and open one in GeoLibre.
+ * Browse public projects shared on the configured share host and open one in
+ * GeoLibre.
  *
  * The listing endpoint only paginates (no server-side search), so this loads
- * pages on demand via "Load more" and filters the already-loaded set in the
- * browser.
+ * pages automatically as the user nears the end of the list and filters the
+ * already-loaded set in the browser.
  */
 export function ProjectGalleryDialog({
   open,
@@ -101,20 +124,32 @@ export function ProjectGalleryDialog({
 }: ProjectGalleryDialogProps) {
   const { t } = useTranslation();
   const trimmedToken = (useDesktopSettingsStore((s) => s.desktopSettings.shareToken) ?? "").trim();
-  const hasToken = trimmedToken.length > 0;
+  // Web-only OAuth session; on desktop/embed both flags stay inert and the
+  // personal-API-token behavior is unchanged.
+  const oauthSupported = supportsShareOAuth();
+  const oauthIssuer = useShareOAuthStore((s) => s.issuer);
+  const oauthPending = useShareOAuthStore((s) => s.pending);
+  const oauthSignedIn = oauthSupported && oauthIssuer !== null;
+  const hasToken = oauthSignedIn || trimmedToken.length > 0;
   const [scope, setScope] = useState<GalleryScope>("featured");
   const [projects, setProjects] = useState<SharedProject[]>([]);
   const [status, setStatus] = useState<"idle" | "loading" | "loadingMore">("idle");
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<GalleryErrorCode | null>(null);
   const [hasMore, setHasMore] = useState(false);
   // Next-page offset tracked from the server's raw record count, not the
   // filtered `projects.length` (normalizeProject may drop records, which would
   // otherwise undershoot the offset and re-deliver already-seen entries).
   const [rawOffset, setRawOffset] = useState(0);
   const [query, setQuery] = useState("");
-  const [openingId, setOpeningId] = useState<string | null>(null);
+  const [openingState, setOpeningState] = useState<{ id: string; action: "open" | "copy" } | null>(
+    null,
+  );
   const [openError, setOpenError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const reloadGenerationRef = useRef(0);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const loadMoreSentinelRef = useRef<HTMLDivElement>(null);
 
   // Without a token, the "My projects" scope isn't available; fall back to the
   // featured tab.
@@ -193,12 +228,28 @@ export function ProjectGalleryDialog({
 
       setStatus(offset === 0 ? "loading" : "loadingMore");
       setError(null);
+      setErrorCode(null);
       try {
         if (effectiveScope === "mine") {
-          // "My projects" returns the full set (no pagination) and includes the
-          // owner's unlisted/private projects via the API token.
+          // "My projects" returns the owner's full set, including unlisted and
+          // private projects. Prefer OAuth when available, with a personal-token
+          // fallback for desktop and transient OAuth refresh failures.
+          let token = trimmedToken;
+          if (oauthSupported) {
+            try {
+              token = (await getShareAccessToken()) ?? trimmedToken;
+            } catch (err) {
+              if (
+                !(err instanceof ShareOAuthError) ||
+                err.code !== "refresh-unavailable" ||
+                !trimmedToken
+              ) {
+                throw err;
+              }
+            }
+          }
           const mine = await fetchMyProjects({
-            token: trimmedToken,
+            token,
             signal: controller.signal,
           });
           if (controller.signal.aborted) return;
@@ -224,24 +275,43 @@ export function ProjectGalleryDialog({
         if (controller.signal.aborted) return;
         if (err instanceof DOMException && err.name === "AbortError") return;
         console.error("Failed to load project gallery", err);
-        setError(galleryErrorMessage(err, t));
+        setErrorCode(err instanceof GalleryError ? err.code : null);
+        setError(galleryErrorMessage(err, t, oauthSupported));
       } finally {
         if (abortRef.current === controller) abortRef.current = null;
         if (!controller.signal.aborted) setStatus("idle");
       }
     },
-    [t, effectiveScope, trimmedToken],
+    [t, effectiveScope, trimmedToken, oauthSupported],
   );
+  // Web sign-in from the gallery. Keep the current error visible while the
+  // popup is pending; a successful sign-in reloads the active scope explicitly
+  // because the issuer may remain unchanged.
+  const handleSignIn = () => {
+    signInToShare()
+      .then(() => {
+        setErrorCode(null);
+        setProjects([]);
+        void loadPage(0);
+      })
+      .catch((err: unknown) => {
+        setError(
+          t(err instanceof ShareOAuthError ? shareOAuthErrorKey(err.code) : "share.oauthFailed"),
+        );
+      });
+  };
 
   // Reload from the first page when the dialog opens or the scope changes (the
   // `loadPage` identity changes with scope); reset transient state and abort any
-  // in-flight request when it closes.
+  // in-flight fetch when it closes.
   useEffect(() => {
+    reloadGenerationRef.current += 1;
     if (open) {
       setProjects([]);
       setQuery("");
-      setOpeningId(null);
+      setOpeningState(null);
       setOpenError(null);
+      setErrorCode(null);
       setHasMore(false);
       setRawOffset(0);
       void loadPage(0);
@@ -251,21 +321,47 @@ export function ProjectGalleryDialog({
     }
   }, [open, loadPage]);
 
-  const handleOpen = async (project: SharedProject) => {
-    setOpeningId(project.id);
+  const handleOpen = async (project: SharedProject, options: { asCopy?: boolean } = {}) => {
+    const action = options.asCopy ? "copy" : "open";
+    setOpeningState({ id: project.id, action });
     setOpenError(null);
     try {
+      // Only private projects in "My projects" need credentials; public and
+      // unlisted opens stay anonymous to avoid a CORS preflight.
+      let token = "";
+      if (effectiveScope === "mine" && project.visibility === "private") {
+        token = trimmedToken;
+        if (oauthSupported) {
+          try {
+            token = (await getShareAccessToken()) ?? trimmedToken;
+          } catch (err) {
+            if (
+              !(err instanceof ShareOAuthError) ||
+              err.code !== "refresh-unavailable" ||
+              !trimmedToken
+            ) {
+              throw err;
+            }
+          }
+        }
+      }
       await onOpenProject(
         project.rawJsonUrl,
-        effectiveScope === "mine" ? projectOpenToken(project, trimmedToken) : undefined,
+        effectiveScope === "mine" ? projectOpenToken(project, token) : undefined,
+        options,
       );
       onOpenChange(false);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
-      console.error("Failed to open gallery project", err);
-      setOpenError(err instanceof Error ? err.message : t("gallery.openError"));
+      setOpenError(
+        err instanceof ShareOAuthError
+          ? t(shareOAuthErrorKey(err.code))
+          : err instanceof Error
+            ? err.message
+            : t("gallery.openError"),
+      );
     } finally {
-      setOpeningId(null);
+      setOpeningState(null);
     }
   };
 
@@ -273,6 +369,25 @@ export function ProjectGalleryDialog({
   const visibleProjects = trimmedQuery
     ? projects.filter((p) => searchHaystack(p).includes(trimmedQuery))
     : projects;
+
+  // Fetch the next page shortly before the end of the gallery scrolls into
+  // view. Recreating the observer after each request also prevents a sentinel
+  // that remains visible from starting the same page more than once.
+  useEffect(() => {
+    const root = scrollContainerRef.current;
+    const sentinel = loadMoreSentinelRef.current;
+    if (!open || !root || !sentinel || !hasMore || trimmedQuery || status !== "idle") return;
+
+    const generation = reloadGenerationRef.current;
+    return observeGalleryEnd({
+      root,
+      sentinel,
+      generation,
+      currentGeneration: () => reloadGenerationRef.current,
+      isLoading: () => abortRef.current !== null,
+      onLoad: () => void loadPage(rawOffset),
+    });
+  }, [hasMore, loadPage, open, rawOffset, status, trimmedQuery]);
 
   const showInitialSpinner = status === "loading" && projects.length === 0;
   const showEmpty = status !== "loading" && !error && visibleProjects.length === 0;
@@ -314,7 +429,9 @@ export function ProjectGalleryDialog({
       >
         <DialogHeader>
           <DialogTitle>{t("gallery.title")}</DialogTitle>
-          <DialogDescription>{t("gallery.description")}</DialogDescription>
+          <DialogDescription>
+            {t("gallery.description", { shareHost: shareHostLabel() })}
+          </DialogDescription>
         </DialogHeader>
 
         <div className="flex w-full gap-1 rounded-md bg-muted p-1 sm:w-auto sm:self-start">
@@ -352,7 +469,31 @@ export function ProjectGalleryDialog({
         </div>
 
         {!hasToken ? (
-          <p className="text-xs text-muted-foreground">{t("gallery.signedOutHint")}</p>
+          oauthSupported ? (
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+              <span>{t("gallery.signedOutHint", { shareHost: shareHostLabel() })}</span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleSignIn}
+                disabled={oauthPending}
+              >
+                {oauthPending ? (
+                  <Loader2 className="me-2 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <LogIn className="me-2 h-3.5 w-3.5" />
+                )}
+                {oauthPending
+                  ? t("share.oauthSigningIn")
+                  : t("share.oauthSignIn", { shareHost: shareHostLabel() })}
+              </Button>
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              {t("gallery.signedOutHint", { shareHost: shareHostLabel() })}
+            </p>
+          )
         ) : null}
 
         {openError ? (
@@ -369,7 +510,10 @@ export function ProjectGalleryDialog({
             `touch-pan-y` + `overscroll-contain` keep the vertical gesture on
             this element on iOS Safari, where the dialog's scroll-lock
             (react-remove-scroll) otherwise swallows the touchmove. */}
-        <div className="-mx-1 min-h-0 flex-1 touch-pan-y overflow-y-auto overscroll-contain px-1 [-webkit-overflow-scrolling:touch]">
+        <div
+          ref={scrollContainerRef}
+          className="-mx-1 min-h-0 flex-1 touch-pan-y overflow-y-auto overscroll-contain px-1 [-webkit-overflow-scrolling:touch]"
+        >
           {showInitialSpinner ? (
             <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -381,50 +525,69 @@ export function ProjectGalleryDialog({
                 <AlertCircle className="h-4 w-4 shrink-0" />
                 {error}
               </p>
-              <Button variant="outline" size="sm" onClick={() => loadPage(0)}>
-                {t("gallery.retry")}
-              </Button>
+              <div className="flex gap-2">
+                <Button variant="outline" size="sm" onClick={() => loadPage(0)}>
+                  {t("gallery.retry")}
+                </Button>
+                {oauthSupported && (!oauthSignedIn || errorCode === "unauthorized") ? (
+                  <Button size="sm" onClick={handleSignIn} disabled={oauthPending}>
+                    {oauthPending ? (
+                      <Loader2 className="me-2 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <LogIn className="me-2 h-3.5 w-3.5" />
+                    )}
+                    {t("share.oauthSignIn", { shareHost: shareHostLabel() })}
+                  </Button>
+                ) : null}
+              </div>
             </div>
-          ) : showEmpty ? (
-            <p className="py-16 text-center text-sm text-muted-foreground">
-              {trimmedQuery
-                ? t("gallery.noMatches")
-                : effectiveScope === "mine"
-                  ? t("gallery.emptyMine")
-                  : effectiveScope === "featured"
-                    ? t("gallery.emptyFeatured")
-                    : t("gallery.empty")}
-            </p>
           ) : (
             <>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {visibleProjects.map((project) => (
-                  <GalleryCard
-                    key={project.id}
-                    project={project}
-                    opening={openingId === project.id}
-                    disabled={openingId !== null}
-                    onOpen={() => void handleOpen(project)}
-                  />
-                ))}
-              </div>
+              {showEmpty ? (
+                <p className="py-16 text-center text-sm text-muted-foreground">
+                  {trimmedQuery
+                    ? t("gallery.noMatches")
+                    : effectiveScope === "mine"
+                      ? t("gallery.emptyMine")
+                      : effectiveScope === "featured"
+                        ? t("gallery.emptyFeatured")
+                        : t("gallery.empty")}
+                </p>
+              ) : (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                  {visibleProjects.map((project) => (
+                    <GalleryCard
+                      key={project.id}
+                      project={project}
+                      openingAction={openingState?.id === project.id ? openingState.action : null}
+                      disabled={openingState !== null}
+                      onOpen={() => void handleOpen(project)}
+                      onOpenCopy={() => void handleOpen(project, { asCopy: true })}
+                    />
+                  ))}
+                </div>
+              )}
               {hasMore && !trimmedQuery ? (
-                <div className="flex justify-center py-4">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={status === "loadingMore"}
-                    onClick={() => loadPage(rawOffset)}
-                  >
-                    {status === "loadingMore" ? (
-                      <>
-                        <Loader2 className="me-2 h-4 w-4 animate-spin" />
-                        {t("gallery.loadingMore")}
-                      </>
-                    ) : (
-                      t("gallery.loadMore")
-                    )}
-                  </Button>
+                <div
+                  ref={loadMoreSentinelRef}
+                  className="flex min-h-12 items-center justify-center py-4"
+                >
+                  {status === "loadingMore" ? (
+                    <span className="flex items-center text-sm text-muted-foreground">
+                      <Loader2 className="me-2 h-4 w-4 animate-spin" />
+                      {t("gallery.loadingMore")}
+                    </span>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        if (abortRef.current === null) void loadPage(rawOffset);
+                      }}
+                    >
+                      {t("gallery.loadMore")}
+                    </Button>
+                  )}
                 </div>
               ) : null}
             </>
@@ -447,22 +610,19 @@ function ScopeTab({
   label: string;
 }) {
   return (
-    <button
+    <Button
       type="button"
-      aria-pressed={active}
+      variant={active ? "secondary" : "ghost"}
+      size="sm"
+      className="flex-1 gap-1.5 sm:flex-none"
       onClick={onClick}
-      className={`flex flex-1 items-center justify-center gap-1.5 rounded px-3 py-1 text-sm font-medium transition-colors sm:flex-none ${
-        active
-          ? "bg-background text-foreground shadow-sm"
-          : "text-muted-foreground hover:text-foreground"
-      }`}
+      aria-pressed={active}
     >
       {icon}
       {label}
-    </button>
+    </Button>
   );
 }
-
 /** A small badge marking unlisted/private projects; public renders nothing. */
 function VisibilityBadge({ visibility }: { visibility: string }) {
   const { t } = useTranslation();
@@ -478,12 +638,13 @@ function VisibilityBadge({ visibility }: { visibility: string }) {
 
 interface GalleryCardProps {
   project: SharedProject;
-  opening: boolean;
+  openingAction: "open" | "copy" | null;
   disabled: boolean;
   onOpen: () => void;
+  onOpenCopy: () => void;
 }
 
-function GalleryCard({ project, opening, disabled, onOpen }: GalleryCardProps) {
+function GalleryCard({ project, openingAction, disabled, onOpen, onOpenCopy }: GalleryCardProps) {
   const { t } = useTranslation();
   const [thumbBroken, setThumbBroken] = useState(false);
 
@@ -510,7 +671,7 @@ function GalleryCard({ project, opening, disabled, onOpen }: GalleryCardProps) {
             <span className="text-xs">{t("gallery.noThumbnail")}</span>
           </span>
         )}
-        {opening ? (
+        {openingAction !== null ? (
           <span className="absolute inset-0 flex items-center justify-center bg-background/60">
             <Loader2 className="h-5 w-5 animate-spin" />
           </span>
@@ -532,15 +693,31 @@ function GalleryCard({ project, opening, disabled, onOpen }: GalleryCardProps) {
           </span>
         </div>
 
-        <div className="mt-2 flex items-center gap-2">
+        <div className="mt-2 flex flex-wrap items-center gap-1.5 sm:flex-nowrap">
           <Button size="sm" className="flex-1" disabled={disabled} onClick={onOpen}>
-            {opening ? (
+            {openingAction === "open" ? (
               <>
                 <Loader2 className="me-2 h-4 w-4 animate-spin" />
                 {t("gallery.opening")}
               </>
             ) : (
               t("gallery.open")
+            )}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="flex-1"
+            disabled={disabled}
+            onClick={onOpenCopy}
+          >
+            {openingAction === "copy" ? (
+              <>
+                <Loader2 className="me-2 h-4 w-4 animate-spin" />
+                {t("gallery.openingCopy")}
+              </>
+            ) : (
+              t("gallery.openCopy")
             )}
           </Button>
           {project.projectUrl ? (

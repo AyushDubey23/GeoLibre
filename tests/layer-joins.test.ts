@@ -149,6 +149,31 @@ describe("applyLayerJoins", () => {
     assert.equal(joins[0].stats?.unmatchedJoinCount, 2);
   });
 
+  it("does not match missing keys inherited from Object.prototype", () => {
+    const { features, joins } = applyLayerJoins(
+      [pointFeature({}), pointFeature({ constructor: "Alabama" })],
+      [join({ targetField: "constructor", joinField: "constructor" })],
+      () =>
+        collection([tableFeature({ pop: 99 }), tableFeature({ constructor: "Alabama", pop: 1 })]),
+    );
+    assert.equal(features[0].properties?.pop, null);
+    assert.equal(features[1].properties?.pop, 1);
+    assert.equal(joins[0].stats?.matchedCount, 1);
+    assert.equal(joins[0].stats?.unmatchedTargetCount, 1);
+    assert.equal(joins[0].stats?.unmatchedJoinCount, 0);
+  });
+
+  it("null-fills missing joined columns whose names exist on Object.prototype", () => {
+    const { features } = applyLayerJoins(states().features, [join()], () =>
+      collection([
+        tableFeature({ state_name: "Alabama", toString: "label" }),
+        tableFeature({ state_name: "Arizona" }),
+      ]),
+    );
+    assert.equal(features[0].properties?.toString, "label");
+    assert.equal(features[2].properties?.toString, null);
+  });
+
   it("keeps the first matching join row when keys repeat", () => {
     const { features } = applyLayerJoins(states().features, [join()], (id) =>
       id === "census"
@@ -389,6 +414,25 @@ describe("store integration", () => {
     assert.equal("pop" in (layer.geojson?.features[0].properties ?? {}), false);
     // The definition itself survives; the Joins UI flags the missing layer.
     assert.equal(layer.joins?.length, 1);
+  });
+
+  it("deleting a group with its join-source children strips dependent columns", () => {
+    const store = useAppStore.getState();
+    const groupId = store.addLayerGroup("Tables");
+    const targetId = store.addGeoJsonLayer("States", states());
+    const tableId = store.addGeoJsonLayer("Census", census());
+    store.moveLayerToGroup(tableId, groupId);
+    store.setLayerJoins(targetId, [join({ joinLayerId: tableId })]);
+    assert.equal(layerById(targetId).geojson?.features[0].properties?.pop, 5_000_000);
+
+    store.removeLayerGroup(groupId, { removeChildren: true });
+    const layer = layerById(targetId);
+    assert.equal("pop" in (layer.geojson?.features[0].properties ?? {}), false);
+    assert.equal(layer.joins?.length, 1);
+    assert.equal(
+      useAppStore.getState().layers.some((candidate) => candidate.id === tableId),
+      false,
+    );
   });
 
   it("takes a patch carrying both geojson and joins verbatim (external callers)", () => {

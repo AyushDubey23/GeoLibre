@@ -27,7 +27,20 @@ interface KmlStyle {
   // that the spec has no key for, so it is round-tripped here and wired into
   // circle-opacity by the map package.
   "marker-opacity"?: number;
+  /** Archive-relative/remote KML icon reference, resolved by the KMZ loader. */
+  __geolibre_kml_icon_href?: string;
 }
+
+/** Internal import metadata used to reconstruct KML Folder groups. */
+export const KML_FOLDER_PATH_PROPERTY = "__geolibre_kml_folder_path";
+
+/**
+ * Internal import metadata carrying a placemark's (possibly inherited) KML
+ * `<TimeSpan>`/`<TimeStamp>` as {@link KmlTimeBounds}, so the importer can turn
+ * time-tagged placemarks into Time Slider frames. Stripped before the features
+ * reach the store.
+ */
+export const KML_TIME_PROPERTY = "__geolibre_kml_time";
 
 /**
  * Parse a KML document into a styled GeoJSON FeatureCollection.
@@ -56,10 +69,16 @@ export function parseKmlText(text: string): FeatureCollection {
   for (const placemark of descendants(root, "Placemark")) {
     const geometry = geometryFromPlacemark(placemark);
     if (!geometry) continue;
+    const folders = folderPath(placemark);
+    const time = parseKmlTime(placemark);
     features.push({
       type: "Feature",
       geometry,
-      properties: placemarkProperties(placemark, styles, styleMaps),
+      properties: {
+        ...placemarkProperties(placemark, styles, styleMaps),
+        ...(folders.length > 0 ? { [KML_FOLDER_PATH_PROPERTY]: folders } : {}),
+        ...(time ? { [KML_TIME_PROPERTY]: time } : {}),
+      },
     });
   }
 
@@ -68,6 +87,17 @@ export function parseKmlText(text: string): FeatureCollection {
   }
 
   return { type: "FeatureCollection", features };
+}
+
+/** Names of the enclosing KML Folder elements, from outermost to innermost. */
+function folderPath(element: Element): string[] {
+  const path: string[] = [];
+  for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+    if (parent.localName.toLowerCase() !== "folder") continue;
+    const name = childText(parent, "name");
+    if (name) path.unshift(name);
+  }
+  return path;
 }
 
 /**
@@ -498,6 +528,9 @@ function styleFromElement(element: Element): KmlStyle {
       style["marker-color"] = color.color;
       style["marker-opacity"] = color.opacity;
     }
+    const icon = directChild(iconStyle, "Icon");
+    const href = icon ? childText(icon, "href") : undefined;
+    if (href) style.__geolibre_kml_icon_href = href;
   }
 
   return style;
@@ -657,9 +690,15 @@ function extendedData(placemark: Element): Record<string, string> {
 
 function descendants(parent: Element, localName: string): Element[] {
   const target = localName.toLowerCase();
-  return Array.from(parent.getElementsByTagName("*")).filter(
-    (element) => element.localName.toLowerCase() === target,
-  );
+  const matches: Element[] = [];
+  const visit = (element: Element): void => {
+    for (const child of Array.from(element.children)) {
+      if (child.localName.toLowerCase() === target) matches.push(child);
+      visit(child);
+    }
+  };
+  visit(parent);
+  return matches;
 }
 
 function directChildren(parent: Element, localName: string): Element[] {

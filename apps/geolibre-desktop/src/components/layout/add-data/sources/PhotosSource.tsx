@@ -11,7 +11,7 @@ import {
 } from "../../../../lib/geotagged-photos";
 import { pickImageFilesWithFallback } from "../../../../lib/tauri-io";
 import { createBaseLayer, errorMessage } from "../helpers";
-import { AddDataSourceForm, useAddDataSource } from "../shared";
+import { AddDataError, AddDataSourceForm, useAddDataSource } from "../shared";
 
 /** Round a lng/lat for the placement prompt so it reads cleanly. */
 function formatCoordinate(value: number): string {
@@ -84,6 +84,7 @@ export function PhotosSource() {
           withoutThumbnail: result.withoutThumbnail,
           total: result.total,
         },
+        { geojson: result.featureCollection },
       ),
       geojson: result.featureCollection,
     };
@@ -111,6 +112,7 @@ export function PhotosSource() {
           total: result.total,
           manualPlacement: true,
         },
+        { geojson: result.featureCollection },
       ),
       geojson: result.featureCollection,
     };
@@ -189,7 +191,7 @@ export function PhotosSource() {
             })}
           </p>
         </div>
-        {source.error ? <p className="text-sm text-destructive">{source.error}</p> : null}
+        {source.error ? <AddDataError message={source.error} /> : null}
         <div className="flex justify-end gap-2">
           <Button
             type="button"

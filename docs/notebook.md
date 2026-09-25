@@ -28,21 +28,52 @@ import geolibre
 
 m = geolibre.connect()          # or geolibre.Map()
 m.fly_to(-122.4, 37.8, zoom=11) # animate the live map in the left pane
-m.add_geojson(gdf, name="My layer")   # GeoDataFrame, dict, or JSON string
+layer_id = m.add_geojson(
+    gdf,
+    name="My layer",
+    fillColor="#facc15",
+    strokeColor="#d97706",
+)  # GeoDataFrame, dict, or JSON string; returns an id on desktop
+m.get_layer(layer_id)
+m.list_layers()
 m.fit_bounds([-123, 37, -122, 38])
 m.set_basemap("https://…/style.json")
-m.set_visibility(layer_id, False)
-m.remove_layer(layer_id)
 ```
 
-Calls are **fire-and-forget**: each posts a command to the host app over the
-shared scripting protocol (the same `createScriptingHandlers` surface used by the
-in-app Python console and the Jupyter widget) and returns immediately, so the
-client behaves identically on the in-browser kernel and a real server. Canonical
-client source: `backend/geolibre_server/notebook_client.py`.
+Most mutation calls are **fire-and-forget**. On desktop, `add_geojson` uses the
+relay's correlated request/reply path and returns the new layer id. The same
+path exposes `list_layers()`, which returns one dict per live layer with `id`,
+`name`, `type`, `visible`, and `opacity`, and `get_layer(layer_id)`, which
+returns one matching layer or raises `ValueError`. The id can be passed directly to
+`set_visibility`, `set_opacity`, `set_style`, `remove_layer`, or
+`zoom_to_layer`.
 
-> Read-back queries (e.g. `get_center`) are not exposed by this fire-and-forget
-> client; they need the blocking request/reply path the `geolibre` widget uses.
+All commands fan out to every GeoLibre window connected to the same Jupyter
+server. For `add_geojson`, `list_layers`, and `get_layer`, the first correlated
+reply is returned to the notebook and later replies are ignored. Because each
+window maintains its own map state, use one connected window when chaining a
+returned layer id into later read-back calls. This behavior is only visible if
+you attach multiple GeoLibre windows to one Jupyter server.
+
+`add_geojson` returns `None` instead of an id in two situations, and never
+fails outright in either:
+
+- **Nothing received the command** (no window connected, or the relay itself
+  unreachable). It behaves like every other mutation — the layer goes out over
+  the display transport with a `GeoLibreNotConnectedWarning`.
+- **A window took it but did not answer within 5s**, which a large
+  `FeatureCollection` can do. You get a `GeoLibreTimeoutWarning`; the layer is
+  still being added, so it is deliberately *not* re-sent (that would add it
+  twice) — find it with `list_layers()`.
+
+The read-back calls have nothing to return in either situation, so they raise
+`GeoLibreNotConnectedError` / `GeoLibreTimeoutError` (both `RuntimeError`)
+instead.
+
+Synchronous read-back is desktop-only. JupyterLite uses browser `postMessage`;
+blocking its Python call would also block the browser event loop that must
+deliver the result. Canonical client source:
+`backend/geolibre_server/notebook_client.py`.
 
 ## Driving the map from an external client (VS Code, …)
 
@@ -117,11 +148,31 @@ Both `npm run dev` and `npm run build` run this automatically:
 - `npm run build` always rebuilds it (via `prebuild`) so a changed client/config
   is picked up.
 
-Both **skip gracefully** when `jupyter lite` is not installed — a Node-only build
-still succeeds and the web Notebook panel shows a "not built" message until the
-site is generated (install the deps above and re-run). The desktop (Tauri) dev
-and build paths skip it entirely (they use the real JupyterLab server), so the
-static site never bloats the installer.
+Both **skip with a warning** when `jupyter lite` is not installed, so a Node-only
+build still succeeds. Be aware of what that produces: the panel does *not* show a
+"not built" message. Its iframe asks for `/jupyterlite/lab/index.html`, and
+anything that answers an unknown path with `index.html` — Tauri's asset
+resolver, or a static host with an SPA fallback such as
+`try_files $uri /index.html` — hands the panel **a second copy of GeoLibre**
+instead (GeoLibre#1851, GeoLibre#1658). Install the deps above and rebuild.
+
+Two builds therefore treat a missing CLI as fatal rather than skippable, because
+they serve the site and cannot degrade: the Mac App Store build, and any build
+that sets `GEOLIBRE_JUPYTERLITE_REQUIRED=1` (the Docker image does). The desktop
+(Tauri) dev and build paths skip it entirely (they use the real JupyterLab
+server), so the static site never bloats the installer.
+
+The Docker image builds and serves the site, and gives `/jupyterlite/` its own
+block in `docker/nginx.conf`:
+
+- Its own CSP — JupyterLab bootstraps from an inline `<script>`, which the app's
+  policy forbids, so under the app policy the site loads its HTML and then never
+  boots.
+- No SPA fallback (`try_files $uri $uri/ =404`), so in this image the failure
+  above surfaces as a plain **404** rather than as the duplicated app. The
+  duplicate remains what Tauri and SPA-fallback hosts produce.
+- The long-lived immutable cache policy for the content-hashed assets, which the
+  prefix match would otherwise take away from them.
 
 Build config lives in `apps/geolibre-desktop/jupyterlite/` (a
 `jupyter_lite_config.json`, the build `requirements.txt`, and a starter

@@ -1,4 +1,4 @@
-import type { Feature, FeatureCollection, MultiPolygon, Polygon } from "geojson";
+import type { Feature, FeatureCollection, Polygon } from "geojson";
 import {
   cellToBoundary,
   cellToChildren,
@@ -14,6 +14,16 @@ import {
 } from "h3-js";
 import type { GeoJSONSource, Map as MapLibreMap, MapMouseEvent } from "maplibre-gl";
 import type { GeoLibreAppAPI, GeoLibrePlugin } from "../types";
+import { getStyleMap } from "./style-map";
+
+/**
+ * The icosahedron H3 projects onto, as densified great-circle edge lines.
+ * Fetched by MapLibre when the layer is first added; the Tauri CSP's blanket
+ * `https:` connect-src already allows the host. Offline, the overlay simply
+ * stays empty.
+ */
+const ICOSAHEDRON_GEOJSON_URL =
+  "https://raw.githubusercontent.com/opengeoshub/vgrid-maplibre/main/H3/icosahedron.geojson";
 
 export const H3_PLUGIN_ID = "maplibre-h3-grid";
 
@@ -25,11 +35,22 @@ const LABEL_LAYER_ID = "geolibre-h3-grid-label";
 const SELECTED_SOURCE_ID = "geolibre-h3-selected-source";
 const SELECTED_FILL_LAYER_ID = "geolibre-h3-selected-fill";
 const SELECTED_LINE_LAYER_ID = "geolibre-h3-selected-line";
+const NEIGHBORS_SOURCE_ID = "geolibre-h3-neighbors-source";
+const NEIGHBORS_FILL_LAYER_ID = "geolibre-h3-neighbors-fill";
+const NEIGHBORS_LINE_LAYER_ID = "geolibre-h3-neighbors-line";
+const PARENTS_SOURCE_ID = "geolibre-h3-parents-source";
+const PARENTS_LINE_LAYER_ID = "geolibre-h3-parents-line";
+const ICOSAHEDRON_SOURCE_ID = "geolibre-h3-icosahedron-source";
+const ICOSAHEDRON_LINE_LAYER_ID = "geolibre-h3-icosahedron-line";
+
+const SELECTED_LINE_WIDTH = 3;
 
 /** Prevent a fine resolution over a large viewport from freezing the browser. */
 export const H3_VIEWPORT_CELL_LIMIT = 20_000;
 
 export interface H3GridSettings {
+  /** Derive the resolution from the map zoom instead of the manual slider. */
+  autoResolution: boolean;
   resolution: number;
   fillColor: string;
   fillOpacity: number;
@@ -37,9 +58,12 @@ export interface H3GridSettings {
   lineWidth: number;
   showLabels: boolean;
   includeNeighbors: boolean;
+  includeParents: boolean;
+  showIcosahedron: boolean;
 }
 
 export const DEFAULT_H3_GRID_SETTINGS: H3GridSettings = {
+  autoResolution: true,
   // Useful immediately at GeoLibre's default world view (resolution 3 would
   // already exceed the viewport safety cap).
   resolution: 2,
@@ -49,12 +73,15 @@ export const DEFAULT_H3_GRID_SETTINGS: H3GridSettings = {
   lineWidth: 1,
   showLabels: true,
   includeNeighbors: false,
+  includeParents: false,
+  showIcosahedron: false,
 };
 
 export interface H3Labels {
   title: string;
   getTitle?: () => string;
   controlTitle: string;
+  autoResolution: string;
   resolution: string;
   cellCount: (count: number) => string;
   tooManyCells: (limit: number) => string;
@@ -81,11 +108,14 @@ export interface H3Labels {
   exportGeoJson: string;
   exportCsv: string;
   includeNeighbors: string;
+  includeParents: string;
+  showIcosahedron: string;
 }
 
 export const DEFAULT_H3_LABELS: H3Labels = {
   title: "H3 Grid",
   controlTitle: "H3 grid settings",
+  autoResolution: "Automatic resolution",
   resolution: "Resolution",
   cellCount: (count) => `${count.toLocaleString()} cells in view`,
   tooManyCells: (limit) =>
@@ -113,6 +143,8 @@ export const DEFAULT_H3_LABELS: H3Labels = {
   exportGeoJson: "Export GeoJSON",
   exportCsv: "Export CSV",
   includeNeighbors: "Include selected cell neighbors",
+  includeParents: "Include selected cell parent",
+  showIcosahedron: "Show icosahedron",
 };
 
 let labels: H3Labels = { ...DEFAULT_H3_LABELS };
@@ -125,9 +157,11 @@ let clickHandler: ((event: MapMouseEvent) => void) | null = null;
 let unsubscribeBasemap: (() => void) | null = null;
 let panelContainer: HTMLElement | null = null;
 let selectedCell: string | null = null;
-type H3PolygonGeometry = Polygon | MultiPolygon;
 
-let currentGrid: FeatureCollection<H3PolygonGeometry> = { type: "FeatureCollection", features: [] };
+let currentGrid: FeatureCollection<Polygon> = {
+  type: "FeatureCollection",
+  features: [],
+};
 let currentError: string | null = null;
 let cachedTextFont: string[] | null = null;
 let pendingRefresh: number | null = null;
@@ -184,9 +218,30 @@ function color(value: unknown, fallback: string): string {
     : fallback;
 }
 
+/**
+ * The automatic zoom→resolution rule, adapted from vgrid-maplibre's H3Grid
+ * getResolution (https://www.npmjs.com/package/vgrid-maplibre): H3 cell area
+ * shrinks ~7x per resolution step versus 4x per zoom level, so resolution
+ * advances at a fraction of a step per zoom level (0.9 here, tuned up from
+ * vgrid's 0.8 for a denser grid), offset so the world view starts at 0,
+ * clamped to the valid range.
+ */
+export function h3ResolutionForZoom(zoom: number): number {
+  return Math.min(15, Math.max(0, Math.floor((zoom - 3) * 0.9)));
+}
+
+/** The resolution actually rendered: zoom-derived when automatic, else manual. */
+function effectiveResolution(): number {
+  return settings.autoResolution && map ? h3ResolutionForZoom(map.getZoom()) : settings.resolution;
+}
+
 export function normalizeH3GridSettings(value: unknown): H3GridSettings {
   const candidate = (value ?? {}) as Partial<H3GridSettings>;
   return {
+    autoResolution:
+      typeof candidate.autoResolution === "boolean"
+        ? candidate.autoResolution
+        : DEFAULT_H3_GRID_SETTINGS.autoResolution,
     resolution: Math.round(
       clampNumber(candidate.resolution, 0, 15, DEFAULT_H3_GRID_SETTINGS.resolution),
     ),
@@ -202,6 +257,14 @@ export function normalizeH3GridSettings(value: unknown): H3GridSettings {
       typeof candidate.includeNeighbors === "boolean"
         ? candidate.includeNeighbors
         : DEFAULT_H3_GRID_SETTINGS.includeNeighbors,
+    includeParents:
+      typeof candidate.includeParents === "boolean"
+        ? candidate.includeParents
+        : DEFAULT_H3_GRID_SETTINGS.includeParents,
+    showIcosahedron:
+      typeof candidate.showIcosahedron === "boolean"
+        ? candidate.showIcosahedron
+        : DEFAULT_H3_GRID_SETTINGS.showIcosahedron,
   };
 }
 
@@ -211,15 +274,24 @@ export function h3LabelMinZoom(resolution: number): number {
 }
 
 export function setH3GridSettings(patch: Partial<H3GridSettings>): void {
-  const previousResolution = settings.resolution;
-  settings = normalizeH3GridSettings({ ...settings, ...patch });
-  if (selectedCell && settings.resolution !== previousResolution) {
-    const [lat, lng] = cellToLatLng(selectedCell);
-    selectedCell = latLngToCell(lat, lng, settings.resolution);
+  const previousResolution = effectiveResolution();
+  // Leaving automatic mode adopts the current zoom-derived resolution as the
+  // fixed one, so the grid stays put instead of jumping to the stale slider.
+  if (settings.autoResolution && patch.autoResolution === false && patch.resolution === undefined) {
+    patch = { ...patch, resolution: previousResolution };
   }
-  // Only the resolution changes the geometry, so a paint/layout-only edit skips
-  // rebuilding up to H3_VIEWPORT_CELL_LIMIT features.
-  if (settings.resolution !== previousResolution) {
+  settings = normalizeH3GridSettings({ ...settings, ...patch });
+  const resolution = effectiveResolution();
+  // Re-derive the selection only for an explicit slider change; toggling
+  // automatic resolution (like zooming in automatic mode) keeps the clicked
+  // cell and its neighbors/parents as they are.
+  if (selectedCell && patch.resolution !== undefined && resolution !== previousResolution) {
+    const [lat, lng] = cellToLatLng(selectedCell);
+    selectedCell = latLngToCell(lat, lng, resolution);
+  }
+  // Only the rendered resolution changes the geometry, so a paint/layout-only
+  // edit skips rebuilding up to H3_VIEWPORT_CELL_LIMIT features.
+  if (resolution !== previousResolution) {
     refresh();
   } else {
     applyStyle();
@@ -229,83 +301,25 @@ export function setH3GridSettings(patch: Partial<H3GridSettings>): void {
 }
 
 /**
- * Keep a cell boundary contiguous around its center. h3-js returns longitudes
- * in [-180, 180], so a cell straddling the antimeridian otherwise contains a
- * ~360° jump that MapLibre draws as a line across the entire world.
- *
- * MapLibre accepts unwrapped longitudes outside [-180, 180] and places them in
- * the adjacent world copy, which preserves the small hexagon at the seam.
+ * Keep a cell boundary contiguous across the antimeridian, mirroring
+ * vgrid-maplibre's H3Grid (https://www.npmjs.com/package/vgrid-maplibre):
+ * when a ring carries a vertex west of -130°, every positive longitude is
+ * shifted down by 360°. A cell straddling the seam mixes ~+179 and ~-179
+ * values, so the shift makes the ring contiguous around -180; MapLibre
+ * renders longitudes past -180 in the adjacent world copy. Rings entirely
+ * away from the seam never match the -130 test and pass through unchanged.
  */
-export function unwrapH3Boundary(
-  ring: [number, number][],
-  centerLongitude: number,
-): [number, number][] {
-  return ring.map(([longitude, latitude]) => {
-    let unwrapped = longitude;
-    while (unwrapped - centerLongitude > 180) unwrapped -= 360;
-    while (unwrapped - centerLongitude < -180) unwrapped += 360;
-    return [unwrapped, latitude];
-  });
-}
-
-function clipRingAtLongitude(
-  ring: [number, number][],
-  longitude: number,
-  keepLower: boolean,
-): [number, number][] {
-  const output: [number, number][] = [];
-  const points =
-    ring.at(-1)?.[0] === ring[0]?.[0] && ring.at(-1)?.[1] === ring[0]?.[1]
-      ? ring.slice(0, -1)
-      : ring;
-  if (points.length < 3) return [];
-
-  const inside = ([x]: [number, number]): boolean => (keepLower ? x <= longitude : x >= longitude);
-  for (let index = 0; index < points.length; index += 1) {
-    const current = points[index];
-    const previous = points[(index + points.length - 1) % points.length];
-    const currentInside = inside(current);
-    const previousInside = inside(previous);
-    if (currentInside !== previousInside) {
-      const ratio = (longitude - previous[0]) / (current[0] - previous[0]);
-      output.push([longitude, previous[1] + ratio * (current[1] - previous[1])]);
-    }
-    if (currentInside) output.push(current);
-  }
-  if (output.length >= 3) output.push([...output[0]] as [number, number]);
-  return output;
-}
-
-/** Split a contiguous cell ring at ±180° so exported coordinates stay valid. */
-export function h3BoundaryGeometry(
-  ring: [number, number][],
-  centerLongitude: number,
-): H3PolygonGeometry {
-  const unwrapped = unwrapH3Boundary(ring, centerLongitude);
-  const longitudes = unwrapped.map(([longitude]) => longitude);
-  const min = Math.min(...longitudes);
-  const max = Math.max(...longitudes);
-  if (max <= 180 && min >= -180) {
-    return { type: "Polygon", coordinates: [unwrapped] };
-  }
-
-  // A ring can graze the seam so narrowly that one side clips to nothing; an
-  // empty linear ring would be invalid GeoJSON, so drop it and emit a Polygon.
-  const seam = max > 180 ? 180 : -180;
-  const shift = max > 180 ? -360 : 360;
-  const kept = clipRingAtLongitude(unwrapped, seam, max > 180);
-  const wrapped = clipRingAtLongitude(unwrapped, seam, max <= 180).map(
-    ([longitude, latitude]) => [longitude + shift, latitude] as [number, number],
+export function h3FixTransmeridianBoundary(ring: [number, number][]): [number, number][] {
+  if (!ring.some(([longitude]) => longitude < -130)) return ring;
+  return ring.map(([longitude, latitude]) =>
+    longitude > 0 ? [longitude - 360, latitude] : [longitude, latitude],
   );
-  const rings = [kept, wrapped].filter((ring) => ring.length >= 4);
-  if (rings.length === 1) return { type: "Polygon", coordinates: [rings[0]] };
-  return { type: "MultiPolygon", coordinates: rings.map((ring) => [ring]) };
 }
 
 /** Convert an H3 cell to a GeoJSON polygon with useful export attributes. */
-export function h3CellFeature(cell: string): Feature<H3PolygonGeometry> {
+export function h3CellFeature(cell: string): Feature<Polygon> {
   const [lat, lng] = cellToLatLng(cell);
-  const boundary = cellToBoundary(cell, true) as [number, number][];
+  const boundary = h3FixTransmeridianBoundary(cellToBoundary(cell, true) as [number, number][]);
   return {
     type: "Feature",
     id: cell,
@@ -317,7 +331,7 @@ export function h3CellFeature(cell: string): Feature<H3PolygonGeometry> {
       center_lng: lng,
       is_pentagon: isPentagon(cell),
     },
-    geometry: h3BoundaryGeometry(boundary, lng),
+    geometry: { type: "Polygon", coordinates: [boundary] },
   };
 }
 
@@ -329,7 +343,7 @@ export function h3GridForBounds(
   bounds: [number, number, number, number],
   resolution: number,
   limit = H3_VIEWPORT_CELL_LIMIT,
-): FeatureCollection<H3PolygonGeometry> {
+): FeatureCollection<Polygon> {
   const [west, southRaw, east, northRaw] = bounds;
   const south = Math.max(-89.999999, Math.min(89.999999, southRaw));
   const north = Math.max(-89.999999, Math.min(89.999999, northRaw));
@@ -385,13 +399,23 @@ function removeLayers(activeMap: MapLibreMap): void {
   for (const id of [
     SELECTED_LINE_LAYER_ID,
     SELECTED_FILL_LAYER_ID,
+    NEIGHBORS_LINE_LAYER_ID,
+    NEIGHBORS_FILL_LAYER_ID,
+    PARENTS_LINE_LAYER_ID,
+    ICOSAHEDRON_LINE_LAYER_ID,
     LABEL_LAYER_ID,
     LINE_LAYER_ID,
     FILL_LAYER_ID,
   ]) {
     if (activeMap.getLayer(id)) activeMap.removeLayer(id);
   }
-  for (const id of [SELECTED_SOURCE_ID, SOURCE_ID]) {
+  for (const id of [
+    SELECTED_SOURCE_ID,
+    NEIGHBORS_SOURCE_ID,
+    PARENTS_SOURCE_ID,
+    ICOSAHEDRON_SOURCE_ID,
+    SOURCE_ID,
+  ]) {
     if (activeMap.getSource(id)) activeMap.removeSource(id);
   }
 }
@@ -404,19 +428,25 @@ function ensureLayers(): void {
       id: FILL_LAYER_ID,
       type: "fill",
       source: SOURCE_ID,
-      paint: { "fill-color": settings.fillColor, "fill-opacity": settings.fillOpacity },
+      paint: {
+        "fill-color": settings.fillColor,
+        "fill-opacity": settings.fillOpacity,
+      },
     });
     map.addLayer({
       id: LINE_LAYER_ID,
       type: "line",
       source: SOURCE_ID,
-      paint: { "line-color": settings.lineColor, "line-width": settings.lineWidth },
+      paint: {
+        "line-color": settings.lineColor,
+        "line-width": settings.lineWidth,
+      },
     });
     map.addLayer({
       id: LABEL_LAYER_ID,
       type: "symbol",
       source: SOURCE_ID,
-      minzoom: h3LabelMinZoom(settings.resolution),
+      minzoom: h3LabelMinZoom(effectiveResolution()),
       layout: {
         "text-field": ["get", "h3"],
         "text-font": pickTextFont(map),
@@ -427,6 +457,63 @@ function ensureLayers(): void {
         "text-color": settings.lineColor,
         "text-halo-color": "#ffffff",
         "text-halo-width": 1,
+      },
+    });
+  }
+  if (!map.getSource(ICOSAHEDRON_SOURCE_ID)) {
+    map.addSource(ICOSAHEDRON_SOURCE_ID, {
+      type: "geojson",
+      data: ICOSAHEDRON_GEOJSON_URL,
+    });
+    map.addLayer({
+      id: ICOSAHEDRON_LINE_LAYER_ID,
+      type: "line",
+      source: ICOSAHEDRON_SOURCE_ID,
+      layout: { visibility: settings.showIcosahedron ? "visible" : "none" },
+      paint: {
+        "line-color": "#dc2626",
+        "line-width": 1.5,
+        "line-dasharray": [2, 2],
+      },
+    });
+  }
+  // Parents and neighbors are added before the selected layers so the clicked
+  // cell stays on top of its (larger) parent and neighbor outlines.
+  if (!map.getSource(PARENTS_SOURCE_ID)) {
+    map.addSource(PARENTS_SOURCE_ID, {
+      type: "geojson",
+      data: { type: "FeatureCollection", features: [] },
+    });
+    map.addLayer({
+      id: PARENTS_LINE_LAYER_ID,
+      type: "line",
+      source: PARENTS_SOURCE_ID,
+      paint: {
+        "line-color": "#b45309",
+        "line-width": SELECTED_LINE_WIDTH * 2,
+        "line-dasharray": [2, 2],
+      },
+    });
+  }
+  if (!map.getSource(NEIGHBORS_SOURCE_ID)) {
+    map.addSource(NEIGHBORS_SOURCE_ID, {
+      type: "geojson",
+      data: { type: "FeatureCollection", features: [] },
+    });
+    map.addLayer({
+      id: NEIGHBORS_FILL_LAYER_ID,
+      type: "fill",
+      source: NEIGHBORS_SOURCE_ID,
+      paint: { "fill-color": "#f59e0b", "fill-opacity": 0.15 },
+    });
+    map.addLayer({
+      id: NEIGHBORS_LINE_LAYER_ID,
+      type: "line",
+      source: NEIGHBORS_SOURCE_ID,
+      paint: {
+        "line-color": "#f59e0b",
+        "line-width": SELECTED_LINE_WIDTH,
+        "line-dasharray": [2, 2],
       },
     });
   }
@@ -445,7 +532,7 @@ function ensureLayers(): void {
       id: SELECTED_LINE_LAYER_ID,
       type: "line",
       source: SELECTED_SOURCE_ID,
-      paint: { "line-color": "#f59e0b", "line-width": 3 },
+      paint: { "line-color": "#f59e0b", "line-width": SELECTED_LINE_WIDTH },
     });
   }
 }
@@ -459,16 +546,27 @@ function applyStyle(): void {
   map.setPaintProperty(LINE_LAYER_ID, "line-width", settings.lineWidth);
   map.setPaintProperty(LABEL_LAYER_ID, "text-color", settings.lineColor);
   map.setLayoutProperty(LABEL_LAYER_ID, "visibility", settings.showLabels ? "visible" : "none");
-  map.setLayerZoomRange(LABEL_LAYER_ID, h3LabelMinZoom(settings.resolution), 24);
+  map.setLayerZoomRange(LABEL_LAYER_ID, h3LabelMinZoom(effectiveResolution()), 24);
+  map.setLayoutProperty(
+    ICOSAHEDRON_LINE_LAYER_ID,
+    "visibility",
+    settings.showIcosahedron ? "visible" : "none",
+  );
 }
 
 function refresh(): void {
   if (!map) return;
+  const resolution = effectiveResolution();
+  // The selected cell (and its neighbors/parents) deliberately stays at the
+  // resolution it was clicked at: in automatic mode a zoom or pan changes the
+  // rendered grid, but re-deriving the selection would silently replace the
+  // cell the user identified. Only an explicit settings change re-indexes it
+  // (see setH3GridSettings).
   try {
     const bounds = map.getBounds();
     currentGrid = h3GridForBounds(
       [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()],
-      settings.resolution,
+      resolution,
     );
     currentError = null;
   } catch (error) {
@@ -482,20 +580,42 @@ function refresh(): void {
   if (panelContainer) renderPanel(panelContainer);
 }
 
-function selectedCells(): string[] {
-  if (!selectedCell) return [];
-  return settings.includeNeighbors ? gridDisk(selectedCell, 1) : [selectedCell];
+function neighborCells(cell: string): string[] {
+  return gridDisk(cell, 1).filter((neighbor) => neighbor !== cell);
+}
+
+/**
+ * The canonical parent at resolution r-1, or none for a resolution-0 cell.
+ * Uses h3-js `cellToParent` — one unique parent per cell.
+ */
+function parentCells(cell: string): string[] {
+  const resolution = getResolution(cell);
+  return resolution > 0 ? [cellToParent(cell, resolution - 1)] : [];
 }
 
 function updateSelectedSource(): void {
   const source = map?.getSource(SELECTED_SOURCE_ID) as GeoJSONSource | undefined;
   source?.setData({
     type: "FeatureCollection",
-    features: selectedCells().map(h3CellFeature),
+    features: selectedCell ? [h3CellFeature(selectedCell)] : [],
+  });
+  const neighborsSource = map?.getSource(NEIGHBORS_SOURCE_ID) as GeoJSONSource | undefined;
+  neighborsSource?.setData({
+    type: "FeatureCollection",
+    features:
+      settings.includeNeighbors && selectedCell
+        ? neighborCells(selectedCell).map(h3CellFeature)
+        : [],
+  });
+  const parentsSource = map?.getSource(PARENTS_SOURCE_ID) as GeoJSONSource | undefined;
+  parentsSource?.setData({
+    type: "FeatureCollection",
+    features:
+      settings.includeParents && selectedCell ? parentCells(selectedCell).map(h3CellFeature) : [],
   });
 }
 
-function gridCsv(grid: FeatureCollection<H3PolygonGeometry>): string {
+function gridCsv(grid: FeatureCollection<Polygon>): string {
   const header = "h3,resolution,base_cell,center_lat,center_lng,is_pentagon";
   const rows = grid.features.map((feature) => {
     const p = feature.properties!;
@@ -506,11 +626,7 @@ function gridCsv(grid: FeatureCollection<H3PolygonGeometry>): string {
 
 function fitSelected(): void {
   if (!selectedCell || !appRef) return;
-  const [, centerLongitude] = cellToLatLng(selectedCell);
-  const ring = unwrapH3Boundary(
-    cellToBoundary(selectedCell, true) as [number, number][],
-    centerLongitude,
-  );
+  const ring = h3FixTransmeridianBoundary(cellToBoundary(selectedCell, true) as [number, number][]);
   const lons = ring.map(([lng]) => lng);
   const lats = ring.map(([, lat]) => lat);
   appRef.fitBounds?.([Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)]);
@@ -561,12 +677,25 @@ function renderPanel(container: HTMLElement): void {
     return element;
   };
 
+  const autoResolution = document.createElement("input");
+  autoResolution.type = "checkbox";
+  autoResolution.checked = settings.autoResolution;
+  autoResolution.addEventListener("change", () =>
+    setH3GridSettings({ autoResolution: autoResolution.checked }),
+  );
+  row(labels.autoResolution, autoResolution);
+
+  // In automatic mode the slider becomes a read-only indicator of the
+  // zoom-derived resolution; refresh() re-renders the panel on every moveend,
+  // so it tracks zoom gestures.
+  const shownResolution = effectiveResolution();
   const resolution = document.createElement("input");
   resolution.type = "range";
   resolution.min = "0";
   resolution.max = "15";
-  resolution.value = String(settings.resolution);
-  resolution.title = String(settings.resolution);
+  resolution.value = String(shownResolution);
+  resolution.title = String(shownResolution);
+  resolution.disabled = settings.autoResolution;
   resolution.addEventListener("input", () => {
     resolution.title = resolution.value;
   });
@@ -577,8 +706,9 @@ function renderPanel(container: HTMLElement): void {
   resolutionWrap.style.display = "flex";
   resolutionWrap.style.alignItems = "center";
   resolutionWrap.style.gap = "6px";
+  resolutionWrap.style.opacity = settings.autoResolution ? "0.6" : "1";
   const resolutionValue = document.createElement("strong");
-  resolutionValue.textContent = String(settings.resolution);
+  resolutionValue.textContent = String(shownResolution);
   resolution.addEventListener("input", () => {
     resolutionValue.textContent = resolution.value;
   });
@@ -614,6 +744,8 @@ function renderPanel(container: HTMLElement): void {
   for (const [text, key] of [
     [labels.showLabels, "showLabels"],
     [labels.includeNeighbors, "includeNeighbors"],
+    [labels.includeParents, "includeParents"],
+    [labels.showIcosahedron, "showIcosahedron"],
   ] as const) {
     const input = document.createElement("input");
     input.type = "checkbox";
@@ -659,7 +791,8 @@ function renderPanel(container: HTMLElement): void {
     addDetail(labels.center, `${lat.toFixed(6)}, ${lng.toFixed(6)}`);
     addDetail(labels.pentagon, isPentagon(selectedCell) ? labels.yes : labels.no);
     if (getResolution(selectedCell) > 0) {
-      addDetail(labels.parent, cellToParent(selectedCell, getResolution(selectedCell) - 1));
+      const [parent] = parentCells(selectedCell);
+      if (parent) addDetail(labels.parent, parent);
     }
     if (getResolution(selectedCell) < 15) {
       addDetail(
@@ -667,7 +800,7 @@ function renderPanel(container: HTMLElement): void {
         String(cellToChildren(selectedCell, getResolution(selectedCell) + 1).length),
       );
     }
-    addDetail(labels.neighbors, String(gridDisk(selectedCell, 1).length - 1));
+    addDetail(labels.neighbors, String(neighborCells(selectedCell).length));
     section.appendChild(details);
   } else {
     const empty = document.createElement("div");
@@ -693,7 +826,7 @@ function renderPanel(container: HTMLElement): void {
       labels.addAsLayer,
       () => {
         if (currentGrid.features.length) {
-          appRef?.addGeoJsonLayer(`H3 grid (resolution ${settings.resolution})`, currentGrid);
+          appRef?.addGeoJsonLayer(`H3 grid (resolution ${effectiveResolution()})`, currentGrid);
         }
       },
       currentGrid.features.length === 0,
@@ -702,7 +835,7 @@ function renderPanel(container: HTMLElement): void {
       labels.exportGeoJson,
       () => {
         appRef?.exportTextFile?.(
-          `h3-grid-r${settings.resolution}.geojson`,
+          `h3-grid-r${effectiveResolution()}.geojson`,
           JSON.stringify(currentGrid, null, 2),
           {
             description: "GeoJSON",
@@ -717,7 +850,7 @@ function renderPanel(container: HTMLElement): void {
     button(
       labels.exportCsv,
       () => {
-        appRef?.exportTextFile?.(`h3-grid-r${settings.resolution}.csv`, gridCsv(currentGrid), {
+        appRef?.exportTextFile?.(`h3-grid-r${effectiveResolution()}.csv`, gridCsv(currentGrid), {
           description: "CSV",
           extensions: ["csv"],
           mimeType: "text/csv",
@@ -740,14 +873,18 @@ export const maplibreH3Plugin: GeoLibrePlugin = {
   id: H3_PLUGIN_ID,
   name: "H3 Grid",
   version: "1.0.0",
+  // Draws the grid through the Style Spec surface both 2D engines share
+  // (GeoJSON sources, fill/line/symbol layers, camera and pointer events), read
+  // through getStyleMap so the Mapbox renderer hosts it as well.
+  engines: ["maplibre", "mapbox"],
   activate: (app) => {
-    const activeMap = app.getMap?.();
+    const activeMap = getStyleMap(app);
     if (!activeMap) return false;
     map = activeMap;
     appRef = app;
     moveHandler = () => scheduleRefresh();
     clickHandler = (event) => {
-      selectedCell = latLngToCell(event.lngLat.lat, event.lngLat.lng, settings.resolution);
+      selectedCell = latLngToCell(event.lngLat.lat, event.lngLat.lng, effectiveResolution());
       updateSelectedSource();
       if (panelContainer) renderPanel(panelContainer);
     };
@@ -764,6 +901,13 @@ export const maplibreH3Plugin: GeoLibrePlugin = {
         dock: "right-of-style",
         defaultWidth: 340,
         render: (container) => renderPanel(container),
+        // Closing the panel ends the identify session: drop the clicked cell
+        // and, with it, the neighbor/parent overlays derived from it.
+        onClose: () => {
+          selectedCell = null;
+          updateSelectedSource();
+          if (panelContainer) renderPanel(panelContainer);
+        },
       }) ?? null;
     refresh();
     app.openRightPanel?.(PANEL_ID);
@@ -774,7 +918,14 @@ export const maplibreH3Plugin: GeoLibrePlugin = {
     if (map && clickHandler) map.off("click", clickHandler);
     unsubscribeBasemap?.();
     unregisterPanel?.();
-    if (map) removeLayers(map);
+    // A renderer swap deactivates this plugin after the old map was removed;
+    // a removed mapbox-gl map throws from getLayer (its style is gone), and
+    // there is nothing left to remove.
+    try {
+      if (map) removeLayers(map);
+    } catch {
+      // Already torn down with the map.
+    }
     moveHandler = null;
     clickHandler = null;
     unsubscribeBasemap = null;

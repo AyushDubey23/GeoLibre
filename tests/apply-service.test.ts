@@ -198,6 +198,30 @@ describe("buildWfsGeoJsonLayer", () => {
     });
     assert.equal((layer.source as Record<string, unknown>).srsName, undefined);
   });
+
+  it("reserves a different palette color for a pending batch sibling", () => {
+    const data: FeatureCollection = {
+      type: "FeatureCollection",
+      features: [{ type: "Feature", geometry: null, properties: {} }],
+    };
+    const params = {
+      name: "First",
+      featureUrl: "https://example.com/wfs",
+      data,
+      typeName: "first",
+      version: "2.0.0",
+      outputFormat: "application/json",
+      srsName: "EPSG:4326",
+    };
+    const first = buildWfsGeoJsonLayer(params);
+    const second = buildWfsGeoJsonLayer({
+      ...params,
+      name: "Second",
+      typeName: "second",
+      pendingLayers: [first],
+    });
+    assert.notEqual(second.style.fillColor, first.style.fillColor);
+  });
 });
 
 describe("field mappers", () => {
@@ -283,6 +307,11 @@ describe("field mappers", () => {
         url: undefined,
         itemId: "abc",
         portalUrl: undefined,
+        // Unset paging fields mean "use the defaults" (whole layer, auto page).
+        pageSize: undefined,
+        maxFeatures: undefined,
+        sublayers: undefined,
+        renderingRule: undefined,
       },
     );
     // Unknown/absent values fall back to the feature + url defaults.
@@ -290,6 +319,34 @@ describe("field mappers", () => {
     assert.equal(defaults.layerType, "feature");
     assert.equal(defaults.sourceType, "url");
     assert.equal(defaults.url, "https://s");
+  });
+
+  it("round-trips a saved map service, keeping its sublayer selection", () => {
+    const options = arcgisFieldsToOptions(
+      entry("arcgis", {
+        layerType: "map-service",
+        sourceType: "url",
+        url: "https://e/arcgis/rest/services/Boundaries/MapServer",
+        sublayers: " 2,5 ",
+      }),
+    );
+    // A saved map service must come back as one: coercing an unknown layer type
+    // to "feature" would silently load the wrong thing from the Browser panel.
+    assert.equal(options.layerType, "map-service");
+    assert.equal(options.sublayers, "2,5");
+  });
+
+  it("round-trips a saved image service, keeping its rendering rule", () => {
+    const options = arcgisFieldsToOptions(
+      entry("arcgis", {
+        layerType: "image-service",
+        sourceType: "url",
+        url: "https://e/arcgis/rest/services/Elevation/ImageServer",
+        renderingRule: '{"rasterFunction":"Hillshade"}',
+      }),
+    );
+    assert.equal(options.layerType, "image-service");
+    assert.equal(options.renderingRule, '{"rasterFunction":"Hillshade"}');
   });
 });
 

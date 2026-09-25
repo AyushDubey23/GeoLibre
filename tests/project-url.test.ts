@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { fetchProjectFromUrl } from "../apps/geolibre-desktop/src/lib/project-url";
+import { fetchProjectFromUrl, parseShareRole } from "../apps/geolibre-desktop/src/lib/project-url";
 
 const PROJECT_URL = "https://example.com/Test.geolibre.json";
 
@@ -219,7 +219,6 @@ describe("fetchProjectFromUrl", () => {
 
 describe("parseShareRole", () => {
   it("parses valid role strings and rejects invalid ones", () => {
-    const { parseShareRole } = require("../apps/geolibre-desktop/src/lib/project-url");
     assert.equal(parseShareRole("view"), "view");
     assert.equal(parseShareRole("comment"), "comment");
     assert.equal(parseShareRole("edit"), "edit");

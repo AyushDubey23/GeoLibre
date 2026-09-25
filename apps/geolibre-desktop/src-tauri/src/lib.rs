@@ -1,4 +1,33 @@
+mod arcgis_http;
+// Earth Engine sign-in uses Google's OAuth loopback-redirect flow, which binds
+// a listener on 127.0.0.1 to accept the browser's redirect. Accepting an
+// inbound connection requires the `com.apple.security.network.server`
+// entitlement, which App Review rejects for an app that otherwise only makes
+// outgoing requests (guideline 2.4.5, submission 76036eca). Both Apple App
+// Store targets therefore compile the whole flow out and hide the Earth Engine
+// UI, so no Apple build ever binds a listening socket: the `mas` (macOS) build,
+// and iOS — which ships through the same review pipeline and has no way to
+// justify a listener either. Every other target (Developer ID macOS, Windows,
+// Linux, Android, web) keeps it. See docs/mac-app-store.md.
+#[cfg(not(any(feature = "mas", target_os = "ios")))]
 mod earth_engine_oauth;
+// App Store stub, mirroring the `native_duckdb` pattern below: the commands stay
+// in the handler list (so a stale panel state or an external plugin gets a clear
+// message instead of an "unknown command" error) but no socket is ever bound.
+#[cfg(any(feature = "mas", target_os = "ios"))]
+mod earth_engine_oauth {
+    const UNAVAILABLE: &str = "Earth Engine sign-in is not available in the App Store build of GeoLibre.";
+
+    #[tauri::command]
+    pub fn start_earth_engine_oauth(_client_id: String) -> Result<serde_json::Value, String> {
+        Err(UNAVAILABLE.to_string())
+    }
+
+    #[tauri::command]
+    pub fn poll_earth_engine_oauth(_state_id: String) -> Result<Option<serde_json::Value>, String> {
+        Err(UNAVAILABLE.to_string())
+    }
+}
 #[cfg(feature = "native-duckdb")]
 mod native_duckdb;
 #[cfg(not(feature = "native-duckdb"))]
@@ -21,26 +50,108 @@ mod native_duckdb {
     }
 }
 
-use earth_engine_oauth::{
-    poll_earth_engine_oauth, start_earth_engine_oauth, EarthEngineOAuthState,
-};
+// The `mas` (Mac App Store) feature builds for the App Sandbox, where the app
+// may neither download executable code (guideline 2.5.2) nor spawn it. DuckDB
+// loads its spatial extension as unsigned native code at runtime, so the two
+// features can never be combined.
+#[cfg(all(feature = "mas", feature = "native-duckdb"))]
+compile_error!("the `mas` (Mac App Store) build must not enable `native-duckdb`: DuckDB loads its spatial extension as unsigned native code at runtime, which App Sandbox and App Store guideline 2.5.2 forbid.");
+
+mod http_body;
+
+use earth_engine_oauth::{poll_earth_engine_oauth, start_earth_engine_oauth};
+#[cfg(not(any(feature = "mas", target_os = "ios")))]
+use earth_engine_oauth::EarthEngineOAuthState;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 use std::env;
+#[cfg(not(feature = "mas"))]
 use std::ffi::OsStr;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::fs;
+#[cfg(not(feature = "mas"))]
+use std::fs::File;
+use std::io::Read;
+#[cfg(not(feature = "mas"))]
+use std::io::{BufRead, BufReader, Cursor, Write};
+#[cfg(not(feature = "mas"))]
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+#[cfg(not(feature = "mas"))]
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(not(feature = "mas"))]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tauri_plugin_dialog::DialogExt;
+
+const PERSISTED_SCOPE_FILES: [&str; 2] = [".persisted-scope", ".persisted-scope-asset"];
+const PERSISTED_PHOTO_EXTENSIONS: [&str; 6] =
+    [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"];
+const IMAGE_PICKER_EXTENSIONS: [&str; 8] =
+    ["jpg", "jpeg", "png", "webp", "heic", "heif", "tif", "tiff"];
+
+#[derive(Deserialize, Serialize)]
+struct PersistedScopeState {
+    allowed_paths: Vec<String>,
+    forbidden_patterns: Vec<String>,
+}
+
+#[derive(Default)]
+struct SelectedImagePaths(Mutex<HashSet<PathBuf>>);
+
+fn is_persisted_image_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    PERSISTED_PHOTO_EXTENSIONS
+        .iter()
+        .any(|extension| lower.ends_with(extension))
+}
+
+fn is_image_picker_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            IMAGE_PICKER_EXTENSIONS
+                .iter()
+                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+        })
+}
+
+/// Remove legacy per-image grants before persisted-scope synchronously replays
+/// them. Photo workflows consume or embed image bytes during the current
+/// session, so these grants are not needed after restart.
+fn prune_persisted_image_scopes(app: &tauri::AppHandle) {
+    let Ok(app_data_dir) = app.path().app_data_dir() else {
+        return;
+    };
+    for file_name in PERSISTED_SCOPE_FILES {
+        let path = app_data_dir.join(file_name);
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(mut state) = bincode::deserialize::<PersistedScopeState>(&bytes) else {
+            continue;
+        };
+        let original_len = state.allowed_paths.len();
+        state
+            .allowed_paths
+            .retain(|allowed| !is_persisted_image_file(allowed));
+        if state.allowed_paths.len() == original_len {
+            continue;
+        }
+        if let Ok(compacted) = bincode::serialize(&state) {
+            let _ = fs::write(path, compacted);
+        }
+    }
+}
+#[cfg(not(feature = "mas"))]
+use std::sync::Arc;
+use std::sync::Mutex;
+#[cfg(not(feature = "mas"))]
 use std::thread;
 use std::time::Duration;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_fs::FsExt;
 
 // OAuth popups are a desktop-only, multi-window concept; Android/iOS have no
@@ -49,38 +160,72 @@ use tauri_plugin_fs::FsExt;
 #[cfg(desktop)]
 static POPUP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(not(feature = "mas"))]
 const MARTIN_VERSION: &str = "martin-v1.10.1";
+#[cfg(not(feature = "mas"))]
 const MARTIN_RELEASE_BASE_URL: &str = "https://github.com/maplibre/martin/releases/download";
+#[cfg(not(feature = "mas"))]
 const MARTIN_START_ATTEMPTS: usize = 3;
+#[cfg(not(feature = "mas"))]
 const MARTIN_HEALTH_ATTEMPTS: usize = 30;
+#[cfg(not(feature = "mas"))]
 const SIDECAR_HEALTH_ATTEMPTS: usize = 180;
+#[cfg(not(feature = "mas"))]
 const SIDECAR_PORT: u16 = 8765;
+// The sidecar's PostGIS endpoints refuse every destination until this variable
+// names the allowed hosts — the check that stops a *shared* deployment (the
+// Docker image, where the sidecar is reachable same-origin through the nginx
+// proxy) from being pointed at arbitrary internal databases. See
+// `_validate_postgis_target` in
+// backend/geolibre_server/geolibre_server/app/postgis.py.
+#[cfg(not(feature = "mas"))]
+const POSTGIS_HOSTS_ENV: &str = "GEOLIBRE_POSTGIS_HOSTS";
+// Desktop is the case that restriction is not aimed at: the sidecar is
+// loopback-bound, token-authenticated, and spawned for one user who is also its
+// operator, so it would only mean a user cannot reach their own database
+// without setting an environment variable for a process the app launches.
+#[cfg(not(feature = "mas"))]
+const POSTGIS_HOSTS_DESKTOP_DEFAULT: &str = "*";
 // The desktop JupyterLab server for the Notebook panel. Loopback-bound and
 // token-gated; uses its own uv project environment so it never disturbs the
 // FastAPI sidecar's env. First start can be slow while uv syncs JupyterLab.
+#[cfg(not(feature = "mas"))]
 const JUPYTER_PORT: u16 = 8766;
 // Polled once per second, so up to ~4 minutes — generous headroom for the
 // first-run `uv sync` of JupyterLab on a cold cache.
+#[cfg(not(feature = "mas"))]
 const JUPYTER_HEALTH_ATTEMPTS: usize = 240;
+#[cfg(not(feature = "mas"))]
 const UV_INSTALL_BASE_URL: &str = "https://astral.sh/uv";
 const REMOTE_TILE_TIMEOUT_SECS: u64 = 8;
+const MAX_HTTP_REDIRECTS: usize = 10;
 const REMOTE_TILE_CONNECT_TIMEOUT_SECS: u64 = 4;
 const URL_RESOLVE_TIMEOUT_SECS: u64 = 15;
+/// Ceiling for a caller-supplied `fetch_url_bytes` budget. The default suits a
+/// tile; callers that download a whole dataset (Add Vector Layer) ask for more,
+/// but not without bound, so a bad value cannot wedge a request indefinitely.
+const MAX_FETCH_TIMEOUT_SECS: u64 = 600;
+const OPEN_PROJECT_FILES_EVENT: &str = "open-project-files";
 
-#[cfg(unix)]
+#[derive(Default)]
+struct PendingProjectPaths(Mutex<VecDeque<String>>);
+
+#[cfg(all(unix, not(feature = "mas")))]
 const SIGTERM: i32 = 15;
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "mas")))]
 const SIGKILL: i32 = 9;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "mas")))]
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
 }
 
+#[cfg(not(feature = "mas"))]
 struct MartinServerState {
     process: Mutex<Option<MartinProcess>>,
 }
 
+#[cfg(not(feature = "mas"))]
 struct SidecarServerState {
     process: Mutex<Option<SidecarProcess>>,
     // Serialize start/stop across every UI surface that can request the shared
@@ -89,6 +234,7 @@ struct SidecarServerState {
     lifecycle: Mutex<()>,
 }
 
+#[cfg(not(feature = "mas"))]
 struct JupyterServerState {
     process: Mutex<Option<JupyterProcess>>,
     // Token of the currently running server, so a reuse path can hand the same
@@ -99,14 +245,17 @@ struct JupyterServerState {
     startup: Mutex<()>,
 }
 
+#[cfg(not(feature = "mas"))]
 struct MartinProcess {
     child: Child,
 }
 
+#[cfg(not(feature = "mas"))]
 struct SidecarProcess {
     child: Child,
 }
 
+#[cfg(not(feature = "mas"))]
 struct JupyterProcess {
     child: Child,
 }
@@ -148,12 +297,14 @@ struct ExternalPluginBundleLoadResult {
     errors: Vec<ExternalPluginBundleError>,
 }
 
+#[cfg(not(feature = "mas"))]
 impl SidecarProcess {
     fn terminate(&mut self) {
         terminate_sidecar_child(&mut self.child);
     }
 }
 
+#[cfg(not(feature = "mas"))]
 impl Drop for MartinProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -161,12 +312,14 @@ impl Drop for MartinProcess {
     }
 }
 
+#[cfg(not(feature = "mas"))]
 impl Drop for SidecarProcess {
     fn drop(&mut self) {
         self.terminate();
     }
 }
 
+#[cfg(not(feature = "mas"))]
 impl JupyterProcess {
     fn terminate(&mut self) {
         // Same process-group teardown as the sidecar (the child is spawned with
@@ -175,6 +328,7 @@ impl JupyterProcess {
     }
 }
 
+#[cfg(not(feature = "mas"))]
 impl Drop for JupyterProcess {
     fn drop(&mut self) {
         self.terminate();
@@ -185,9 +339,40 @@ impl Drop for JupyterProcess {
 pub fn run() {
     configure_linux_webkit();
 
-    tauri::Builder::default()
+    let pending_project_paths = PendingProjectPaths(Mutex::new(VecDeque::from(
+        project_paths_from_args(env::args_os().skip(1), &current_working_directory()),
+    )));
+    let builder = tauri::Builder::default();
+
+    // Windows and Linux deliver a file-association launch by starting another
+    // process with the document path in argv. Keep one workspace and forward
+    // that path to it. Register this first, as required by the plugin.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+        let paths = project_paths_from_args(
+            args.into_iter().skip(1).map(std::ffi::OsString::from),
+            Path::new(&cwd),
+        );
+        enqueue_project_paths(app, paths);
+        focus_main_window(app);
+    }));
+
+    let builder = builder
+        .manage(pending_project_paths)
+        .manage(SelectedImagePaths::default())
+        .manage(arcgis_http::ArcGISRequests::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        // Runs before persisted-scope's setup hook so legacy photo grants are
+        // removed before its synchronous restore can delay window creation.
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("photo-scope-cleanup")
+                .setup(|app, _api| {
+                    prune_persisted_image_scopes(app);
+                    Ok(())
+                })
+                .build(),
+        )
         // Must init after the fs plugin: it restores previously-granted fs
         // scope (e.g. Browser-panel pinned folders) so they survive a restart.
         //
@@ -203,7 +388,18 @@ pub fn run() {
         .plugin(tauri_plugin_geolocation::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(EarthEngineOAuthState::default())
+        .plugin(tauri_plugin_deep_link::init());
+
+    // The Earth Engine OAuth loopback listener is compiled out of the Apple App
+    // Store builds (see the module gate at the top of this file); the stub
+    // commands are stateless, so the state goes with it.
+    #[cfg(not(any(feature = "mas", target_os = "ios")))]
+    let builder = builder.manage(EarthEngineOAuthState::default());
+
+    // The Martin/sidecar/Jupyter process managers exist only where the commands
+    // that spawn those processes do; the MAS build compiles both out together.
+    #[cfg(not(feature = "mas"))]
+    let builder = builder
         .manage(MartinServerState {
             process: Mutex::new(None),
         })
@@ -215,17 +411,24 @@ pub fn run() {
             process: Mutex::new(None),
             token: Mutex::new(None),
             startup: Mutex::new(()),
-        })
+        });
+
+    let app = builder
         .invoke_handler(tauri::generate_handler![
             close_oauth_popups,
             native_duckdb::count_native_vector_file_features,
             ensure_martin_binary,
             fetch_url_bytes,
+            arcgis_http::fetch_arcgis_response,
+            arcgis_http::cancel_arcgis_request,
             install_external_plugin_archive,
             native_duckdb::load_native_vector_file,
             load_external_plugin_bundles,
+            pick_image_paths,
+            read_selected_image,
             read_admin_profile,
             read_env_vars,
+            take_pending_project_paths,
             allow_raster_asset,
             read_local_file,
             read_project_file,
@@ -246,8 +449,108 @@ pub fn run() {
             create_main_window(app)?;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running GeoLibre Desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building GeoLibre Desktop");
+
+    app.run(|_app, _event| {
+        // macOS delivers associated files as native open events instead
+        // of argv. Queue them through the same path as a second desktop launch.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Opened { urls } = _event {
+            let paths = project_paths_from_args(
+                urls.into_iter()
+                    .filter_map(|url| url.to_file_path().ok())
+                    .map(std::ffi::OsString::from),
+                Path::new("/"),
+            );
+            enqueue_project_paths(_app, paths);
+            focus_main_window(_app);
+        }
+    });
+}
+
+fn current_working_directory() -> PathBuf {
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn has_geolibre_project_extension(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    lower.ends_with(".geolibre") || lower.ends_with(".geolibre.json")
+}
+
+fn project_path_string(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    #[cfg(target_os = "windows")]
+    if let Some(unprefixed) = value.strip_prefix(r"\\?\") {
+        return unprefixed.to_string();
+    }
+    value.into_owned()
+}
+
+/// Resolve existing GeoLibre project files supplied by the operating system.
+///
+/// Other CLI flags are deliberately ignored. Resolving the path before it
+/// reaches the webview both handles a relative command-line path correctly and
+/// prevents a symlink with a project-looking name from bypassing the existing
+/// `read_project_file` extension check.
+fn project_paths_from_args<I>(args: I, cwd: &Path) -> Vec<String>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    args.into_iter()
+        .filter_map(|argument| {
+            let candidate = PathBuf::from(argument);
+            if !has_geolibre_project_extension(&candidate) {
+                return None;
+            }
+            let absolute = if candidate.is_absolute() {
+                candidate
+            } else {
+                cwd.join(candidate)
+            };
+            let canonical = fs::canonicalize(absolute).ok()?;
+            if !canonical.is_file() || !has_geolibre_project_extension(&canonical) {
+                return None;
+            }
+            let path = project_path_string(&canonical);
+            is_allowed_project_path(&path).then_some(path)
+        })
+        .collect()
+}
+
+fn enqueue_project_paths(app: &tauri::AppHandle, paths: Vec<String>) {
+    if paths.is_empty() {
+        return;
+    }
+    app.state::<PendingProjectPaths>()
+        .0
+        .lock()
+        .expect("pending project path lock poisoned")
+        .extend(paths);
+    let _ = app.emit(OPEN_PROJECT_FILES_EVENT, ());
+}
+
+fn focus_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        // `unminimize` is desktop-only in Tauri v2: there is no minimized state
+        // on mobile, and referencing it fails to compile for both
+        // aarch64-linux-android and aarch64-apple-ios.
+        #[cfg(desktop)]
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// Drain project paths that arrived through argv or an OS file-open event.
+#[tauri::command]
+fn take_pending_project_paths(state: tauri::State<'_, PendingProjectPaths>) -> Vec<String> {
+    state
+        .0
+        .lock()
+        .expect("pending project path lock poisoned")
+        .drain(..)
+        .collect()
 }
 
 /// Whether `read_project_file` may read `path`: an absolute local path (POSIX
@@ -397,20 +700,97 @@ fn read_local_file(path: String) -> Result<tauri::ipc::Response, String> {
         .map_err(|error| format!("Could not read local file: {error}"))
 }
 
-/// Add one user-selected GeoTIFF to the asset-protocol scope. The filesystem
-/// and asset scopes are separate in Tauri; dialogs and native drops grant the
-/// former, but maplibre-gl-raster fetches through the latter for range reads.
+/// Pick images without adding them to Tauri's filesystem or asset scopes. The
+/// returned paths enter a short-lived native allowlist and can only be consumed
+/// by `read_selected_image`.
 #[tauri::command]
-fn allow_raster_asset(app: tauri::AppHandle, path: String) -> Result<(), String> {
+async fn pick_image_paths(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let dialog_app = app.clone();
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        dialog_app
+            .dialog()
+            .file()
+            .add_filter("Images", &IMAGE_PICKER_EXTENSIONS)
+            .blocking_pick_files()
+    })
+    .await
+    .map_err(|error| format!("Could not open the image picker: {error}"))?
+    .unwrap_or_default();
+
+    let mut paths = Vec::with_capacity(selected.len());
+    for file in selected {
+        let path = file
+            .into_path()
+            .map_err(|error| format!("Could not resolve a selected image path: {error}"))?;
+        if is_image_picker_path(&path) {
+            paths.push(path);
+        }
+    }
+    app.state::<SelectedImagePaths>()
+        .0
+        .lock()
+        .map_err(|_| "Could not lock the selected-image allowlist".to_string())?
+        .extend(paths.iter().cloned());
+    Ok(paths
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
+}
+
+/// Read one image explicitly selected by `pick_image_paths`, then remove its
+/// path from the allowlist. This avoids both persistent grants and access to
+/// unselected sibling files.
+#[tauri::command]
+fn read_selected_image(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<tauri::ipc::Response, String> {
+    let path = PathBuf::from(path);
+    let selected = app.state::<SelectedImagePaths>();
+    {
+        let mut allowed = selected
+            .0
+            .lock()
+            .map_err(|_| "Could not lock the selected-image allowlist".to_string())?;
+        if !allowed.remove(&path) {
+            return Err("Refusing to read an image that was not selected".to_string());
+        }
+    }
+    fs::read(&path)
+        .map(tauri::ipc::Response::new)
+        .map_err(|error| format!("Could not read selected image: {error}"))
+}
+
+/// Add one GeoTIFF to the asset-protocol scope. The filesystem and asset scopes
+/// are separate in Tauri; dialogs and native drops grant the former, but
+/// maplibre-gl-raster fetches through the latter for range reads. A GeoTIFF
+/// referenced by an imported project -- QGIS (`.qgs`/`.qgz`) or ArcGIS Pro
+/// (`.aprx`/`.mapx`) -- is also accepted when that project file itself was
+/// explicitly selected by the user.
+#[tauri::command]
+fn allow_raster_asset(
+    app: tauri::AppHandle,
+    path: String,
+    import_project_path: Option<String>,
+) -> Result<(), String> {
     let lower = path.to_ascii_lowercase();
     if !is_safe_absolute_path(&path) || !(lower.ends_with(".tif") || lower.ends_with(".tiff")) {
         return Err(format!(
             "Refusing to expose \"{path}\": not an absolute GeoTIFF path"
         ));
     }
-    if !app.fs_scope().is_allowed(&path) {
+    let selected_import_project = import_project_path.is_some_and(|project_path| {
+        let lower = project_path.to_ascii_lowercase();
+        is_safe_absolute_path(&project_path)
+            && (lower.ends_with(".qgs")
+                || lower.ends_with(".qgz")
+                || lower.ends_with(".aprx")
+                || lower.ends_with(".mapx"))
+            && app.fs_scope().is_allowed(&project_path)
+    });
+    if !app.fs_scope().is_allowed(&path) && !selected_import_project {
         return Err(format!(
-            "Refusing to expose \"{path}\": the file was not selected or dropped by the user"
+            "Refusing to expose \"{path}\": neither the file nor its imported project was selected by the user"
         ));
     }
     app.asset_protocol_scope()
@@ -550,6 +930,7 @@ const ALLOWED_ENV_VARS: &[&str] = &[
     "OPENAI_COMPATIBLE_API_KEY",
     "OPENAI_COMPATIBLE_MODEL",
     "TAVILY_API_KEY",
+    "JEV_API_KEY",
 ];
 
 /// Read the AI Assistant's allowlisted variables from the OS environment.
@@ -712,16 +1093,57 @@ fn ensure_fetchable_url(url: &str) -> Result<(), String> {
 
 /// A redirect policy that re-applies [`url_is_fetchable`] to every hop, so a
 /// public URL that 3xx-redirects to an internal address is not followed.
+///
+/// A blocked hop fails the request via `attempt.error` rather than
+/// `attempt.stop`: stopping makes reqwest hand the 30x response back as `Ok`,
+/// which reaches the frontend as a bland "Request failed with status 302" that
+/// [`is_ssrf_guard_error`] cannot recognise — and an unrecognised failure is
+/// retried by the webview's unguarded `fetch`, which would follow the very
+/// redirect this policy refused. Failing with [`SSRF_BLOCKED_MESSAGE`] in the
+/// error's source chain keeps that fallback closed. The hop cap still uses
+/// `stop`: an over-long but otherwise allowed chain is not an SSRF rejection
+/// and must not be reported as one.
 fn guarded_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() >= 10 {
+        if attempt.previous().len() >= MAX_HTTP_REDIRECTS {
             return attempt.stop();
         }
         match url_is_fetchable(attempt.url()) {
             Ok(()) => attempt.follow(),
-            Err(_) => attempt.stop(),
+            Err(_) => attempt.error(SSRF_BLOCKED_MESSAGE),
         }
     })
+}
+
+/// True when a reqwest failure was caused by the SSRF guard rather than by the
+/// network.
+///
+/// Neither guard's rejection is visible in the top-level `Display`: the redirect
+/// policy's error is wrapped in reqwest's "error following redirect", and
+/// [`GuardedDnsResolver`]'s is wrapped by the connector. Both keep
+/// [`SSRF_BLOCKED_MESSAGE`] in the source chain, so walk it.
+fn is_ssrf_guard_error(error: &dyn std::error::Error) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.to_string().contains(SSRF_BLOCKED_MESSAGE) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+/// Renders a request failure for the frontend, preserving
+/// [`SSRF_BLOCKED_MESSAGE`] verbatim when the guard was what refused it.
+///
+/// `isBlockedUrlError` in `src/lib/vector-url-fetch.ts` matches on that wording
+/// to decide whether retrying in the webview is safe, so a guard rejection that
+/// reaches it as a generic transport error fails *open* into an unguarded fetch.
+fn request_error_message(error: &reqwest::Error) -> String {
+    if is_ssrf_guard_error(error) {
+        return SSRF_BLOCKED_MESSAGE.to_string();
+    }
+    format!("Request failed: {error}")
 }
 
 /// A DNS resolver that drops any address in a blocked range, so reqwest connects
@@ -898,12 +1320,18 @@ fn guarded_http_client() -> Result<reqwest::blocking::Client, String> {
 }
 
 fn build_guarded_http_client() -> Result<reqwest::blocking::Client, String> {
+    build_guarded_http_client_with_redirects(guarded_redirect_policy())
+}
+
+fn build_guarded_http_client_with_redirects(
+    redirects: reqwest::redirect::Policy,
+) -> Result<reqwest::blocking::Client, String> {
     // The SSRF guard (GuardedDnsResolver + redirect re-validation) is applied
     // here, independent of the TLS backend chosen below, so it holds on both the
     // rustls and native-tls paths.
     let mut builder = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(REMOTE_TILE_CONNECT_TIMEOUT_SECS))
-        .redirect(guarded_redirect_policy())
+        .redirect(redirects)
         .dns_resolver(std::sync::Arc::new(GuardedDnsResolver))
         .user_agent("GeoLibre Desktop");
 
@@ -926,32 +1354,67 @@ fn build_guarded_http_client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|error| format!("Could not create HTTP client: {error}"))
 }
 
+/// Fetches a URL's bytes, bypassing browser CORS.
+///
+/// `timeout_secs` overrides the tile-sized default for callers that download a
+/// whole dataset rather than a tile; it is clamped to
+/// `[REMOTE_TILE_TIMEOUT_SECS, MAX_FETCH_TIMEOUT_SECS]`, so the budget can only
+/// ever be raised and never removed.
+/// `max_bytes`, when supplied, limits the body while it is read rather than
+/// buffering an oversized response before rejecting it.
 #[tauri::command]
-async fn fetch_url_bytes(url: String) -> Result<Vec<u8>, String> {
-    tauri::async_runtime::spawn_blocking(move || fetch_url_bytes_blocking(url))
-        .await
-        .map_err(|error| format!("Tile fetch task failed: {error}"))?
+async fn fetch_url_bytes(
+    url: String,
+    timeout_secs: Option<u64>,
+    max_bytes: Option<u64>,
+) -> Result<Vec<u8>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_url_bytes_blocking(url, timeout_secs, max_bytes)
+    })
+    .await
+    .map_err(|error| format!("Tile fetch task failed: {error}"))?
 }
 
-fn fetch_url_bytes_blocking(url: String) -> Result<Vec<u8>, String> {
+/// Resolves the request budget for a fetch, defaulting to the tile timeout and
+/// clamping a caller-supplied value into `[REMOTE_TILE_TIMEOUT_SECS,
+/// MAX_FETCH_TIMEOUT_SECS]`. A caller can therefore only ever raise the budget,
+/// and never past the ceiling or down to zero (which reqwest reads as "no
+/// timeout" and would let a stalled request hang forever).
+fn resolve_fetch_timeout_secs(timeout_secs: Option<u64>) -> u64 {
+    timeout_secs
+        .unwrap_or(REMOTE_TILE_TIMEOUT_SECS)
+        .clamp(REMOTE_TILE_TIMEOUT_SECS, MAX_FETCH_TIMEOUT_SECS)
+}
+
+fn fetch_url_bytes_blocking(
+    url: String,
+    timeout_secs: Option<u64>,
+    max_bytes: Option<u64>,
+) -> Result<Vec<u8>, String> {
     ensure_fetchable_url(&url)?;
 
     let client = guarded_http_client()?;
+    let timeout = resolve_fetch_timeout_secs(timeout_secs);
 
     let response = client
         .get(&url)
-        .timeout(Duration::from_secs(REMOTE_TILE_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(timeout))
         .send()
-        .map_err(|error| format!("Request failed: {error}"))?;
+        .map_err(|error| request_error_message(&error))?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("Request failed with status {status}"));
     }
 
-    response
-        .bytes()
-        .map(|bytes| bytes.to_vec())
-        .map_err(|error| format!("Could not read response body: {error}"))
+    if let Some(limit) = max_bytes {
+        let content_length = response.content_length();
+        http_body::read_limited_body(response, content_length, limit)
+    } else {
+        response
+            .bytes()
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| format!("Could not read response body: {error}"))
+    }
 }
 
 /// Install a packaged plugin from a local `.zip` archive into GeoLibre's
@@ -960,6 +1423,7 @@ fn fetch_url_bytes_blocking(url: String) -> Result<Vec<u8>, String> {
 /// `plugin.json`, enforcing the manifest rules, and confirming the entry and
 /// optional style are present and within the size limit), so only a loadable
 /// plugin lands in the plugins directory. Returns the installed plugin id.
+#[cfg(not(feature = "mas"))]
 #[tauri::command]
 async fn install_external_plugin_archive(
     app: tauri::AppHandle,
@@ -972,6 +1436,7 @@ async fn install_external_plugin_archive(
     .map_err(|error| format!("Plugin install task failed: {error}"))?
 }
 
+#[cfg(not(feature = "mas"))]
 fn install_external_plugin_archive_blocking(
     app: &tauri::AppHandle,
     source_path: String,
@@ -1021,6 +1486,7 @@ fn install_external_plugin_archive_blocking(
 /// `_` and leading dots are stripped to keep the name from escaping the plugins
 /// directory or producing a hidden file. Using the id as the file name gives a
 /// reinstall natural overwrite semantics.
+#[cfg(not(feature = "mas"))]
 fn plugin_archive_file_name(id: &str) -> String {
     let sanitized: String = id
         .chars()
@@ -1045,6 +1511,7 @@ fn plugin_archive_file_name(id: &str) -> String {
     format!("{safe}.zip")
 }
 
+#[cfg(not(feature = "mas"))]
 #[tauri::command]
 async fn load_external_plugin_bundles(
     app: tauri::AppHandle,
@@ -1057,6 +1524,7 @@ async fn load_external_plugin_bundles(
     .map_err(|error| format!("External plugin scan task failed: {error}"))?
 }
 
+#[cfg(not(feature = "mas"))]
 fn load_external_plugin_bundles_blocking(
     app: &tauri::AppHandle,
     additional_plugin_directories: Vec<String>,
@@ -1103,6 +1571,7 @@ fn load_external_plugin_bundles_blocking(
     })
 }
 
+#[cfg(not(feature = "mas"))]
 fn normalize_path_key(path: &Path) -> String {
     // Canonicalize so symlinks and case differences on case-insensitive file
     // systems (Windows, macOS) dedupe to one key; fall back to the raw path
@@ -1111,6 +1580,7 @@ fn normalize_path_key(path: &Path) -> String {
     canonical.to_string_lossy().replace('\\', "/")
 }
 
+#[cfg(not(feature = "mas"))]
 fn scan_external_plugin_directory(
     plugin_dir: &Path,
     bundles: &mut Vec<ExternalPluginBundle>,
@@ -1184,12 +1654,14 @@ fn scan_external_plugin_directory(
     }
 }
 
+#[cfg(not(feature = "mas"))]
 fn is_zip_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
 }
 
+#[cfg(not(feature = "mas"))]
 fn load_external_plugin_archive(
     path: &Path,
     archive_name: &str,
@@ -1237,6 +1709,7 @@ fn load_external_plugin_archive(
 /// root `plugin.json`, otherwise returns the shallowest `*/plugin.json`, ignoring
 /// the `__MACOSX/` metadata folder macOS adds to archives. Returns the manifest's
 /// full path within the archive, or None when no plugin.json is present.
+#[cfg(not(feature = "mas"))]
 fn find_zip_manifest_path<R: Read + std::io::Seek>(archive: &zip::ZipArchive<R>) -> Option<String> {
     let names: Vec<&str> = archive.file_names().collect();
     if names.contains(&"plugin.json") {
@@ -1257,6 +1730,7 @@ fn find_zip_manifest_path<R: Read + std::io::Seek>(archive: &zip::ZipArchive<R>)
     best.map(str::to_string)
 }
 
+#[cfg(not(feature = "mas"))]
 fn load_external_plugin_directory(
     path: &Path,
     archive_name: &str,
@@ -1280,6 +1754,7 @@ fn load_external_plugin_directory(
     })
 }
 
+#[cfg(not(feature = "mas"))]
 fn read_fs_text_entry(root: &Path, entry_name: &str, label: &str) -> Result<String, String> {
     let entry_path = root.join(entry_name);
     if !entry_path.is_file() {
@@ -1303,8 +1778,10 @@ fn read_fs_text_entry(root: &Path, entry_name: &str, label: &str) -> Result<Stri
     Ok(text)
 }
 
+#[cfg(not(feature = "mas"))]
 const MAX_PLUGIN_ENTRY_BYTES: u64 = 50 * 1024 * 1024;
 
+#[cfg(not(feature = "mas"))]
 fn read_zip_text_entry<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
@@ -1333,6 +1810,7 @@ fn read_zip_text_entry<R: Read + std::io::Seek>(
     Ok(text)
 }
 
+#[cfg(not(feature = "mas"))]
 fn validate_external_plugin_manifest(manifest: &ExternalPluginManifest) -> Result<(), String> {
     validate_required_manifest_string("id", &manifest.id)?;
     validate_required_manifest_string("name", &manifest.name)?;
@@ -1357,6 +1835,7 @@ fn validate_external_plugin_manifest(manifest: &ExternalPluginManifest) -> Resul
     Ok(())
 }
 
+#[cfg(not(feature = "mas"))]
 fn validate_required_manifest_string(field: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("{field} must not be empty"));
@@ -1369,6 +1848,7 @@ fn validate_required_manifest_string(field: &str, value: &str) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(not(feature = "mas"))]
 fn validate_optional_manifest_string(field: &str, value: &str) -> Result<(), String> {
     if value.trim() != value {
         return Err(format!(
@@ -1378,6 +1858,7 @@ fn validate_optional_manifest_string(field: &str, value: &str) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(not(feature = "mas"))]
 fn validate_external_plugin_path(field: &str, value: &str) -> Result<(), String> {
     if value.starts_with('/') {
         return Err(format!("{field} must be a relative path"));
@@ -1425,7 +1906,7 @@ fn resolve_url_redirect_blocking(url: String) -> Result<String, String> {
         .header("accept", "application/json, text/plain;q=0.9, */*;q=0.8")
         .timeout(timeout)
         .send()
-        .map_err(|error| format!("Request failed: {error}"))?;
+        .map_err(|error| request_error_message(&error))?;
     if has_xyz_placeholders(response.url().as_str()) {
         return Ok(response.url().to_string());
     }
@@ -1515,11 +1996,94 @@ struct JupyterServerInfo {
     token: String,
 }
 
+// Mac App Store stubs. The App Sandbox forbids spawning downloaded executables
+// and guideline 2.5.2 forbids downloading executable code, so the `mas` feature
+// compiles out everything that does either: the Python sidecar, the Jupyter
+// server, the Martin tile server, the managed uv install, and external plugin
+// installation. Each stub keeps the real command's name, signature, and Ok type
+// so the generate_handler! list and the frontend's invoke calls are unchanged;
+// they fail with a clear message instead. DuckDB-WASM processing and the
+// plugins bundled into the app are unaffected.
+#[cfg(feature = "mas")]
+#[tauri::command]
+fn ensure_martin_binary(_app: tauri::AppHandle) -> Result<MartinBinaryInfo, String> {
+    Err("The Martin tile server is not available in the Mac App Store build.".to_string())
+}
+
+#[cfg(feature = "mas")]
+#[tauri::command]
+async fn start_martin_server(
+    _app: tauri::AppHandle,
+    _connection_string: String,
+    _default_srid: Option<String>,
+) -> Result<MartinServerInfo, String> {
+    Err("The Martin tile server is not available in the Mac App Store build.".to_string())
+}
+
+// The real command borrows tauri::State<MartinServerState>, but that state is
+// neither defined nor managed in this build, so the stub takes no argument (the
+// frontend passes none; state is injected server-side).
+#[cfg(feature = "mas")]
+#[tauri::command]
+fn stop_martin_server() -> Result<(), String> {
+    Err("The Martin tile server is not available in the Mac App Store build.".to_string())
+}
+
+#[cfg(feature = "mas")]
+#[tauri::command]
+async fn start_geolibre_sidecar(_app: tauri::AppHandle) -> Result<SidecarServerInfo, String> {
+    Err("The GeoLibre processing server is not available in the Mac App Store build.".to_string())
+}
+
+#[cfg(feature = "mas")]
+#[tauri::command]
+async fn stop_geolibre_sidecar(_app: tauri::AppHandle) -> Result<(), String> {
+    Err("The GeoLibre processing server is not available in the Mac App Store build.".to_string())
+}
+
+#[cfg(feature = "mas")]
+#[tauri::command]
+async fn start_jupyter_server(_app: tauri::AppHandle) -> Result<JupyterServerInfo, String> {
+    Err("The Jupyter notebook server is not available in the Mac App Store build.".to_string())
+}
+
+#[cfg(feature = "mas")]
+#[tauri::command]
+async fn stop_jupyter_server(_app: tauri::AppHandle) -> Result<(), String> {
+    Err("The Jupyter notebook server is not available in the Mac App Store build.".to_string())
+}
+
+#[cfg(feature = "mas")]
+#[tauri::command]
+async fn install_external_plugin_archive(
+    _app: tauri::AppHandle,
+    _source_path: String,
+) -> Result<String, String> {
+    Err("External plugin installation is not available in the Mac App Store build.".to_string())
+}
+
+// Succeeds with an empty scan rather than erroring, so the startup plugin load
+// degrades silently instead of surfacing a failure on every launch.
+#[cfg(feature = "mas")]
+#[tauri::command]
+async fn load_external_plugin_bundles(
+    _app: tauri::AppHandle,
+    _additional_plugin_directories: Vec<String>,
+) -> Result<ExternalPluginBundleLoadResult, String> {
+    Ok(ExternalPluginBundleLoadResult {
+        plugins_directories: Vec::new(),
+        bundles: Vec::new(),
+        errors: Vec::new(),
+    })
+}
+
+#[cfg(not(feature = "mas"))]
 #[tauri::command]
 fn ensure_martin_binary(app: tauri::AppHandle) -> Result<MartinBinaryInfo, String> {
     ensure_martin_binary_path(&app)
 }
 
+#[cfg(not(feature = "mas"))]
 #[tauri::command]
 async fn start_martin_server(
     app: tauri::AppHandle,
@@ -1533,6 +2097,7 @@ async fn start_martin_server(
     .map_err(|error| format!("Could not join Martin startup task: {error}"))?
 }
 
+#[cfg(not(feature = "mas"))]
 fn start_martin_server_blocking(
     app: tauri::AppHandle,
     connection_string: String,
@@ -1592,6 +2157,7 @@ fn start_martin_server_blocking(
     Err(last_error)
 }
 
+#[cfg(not(feature = "mas"))]
 #[tauri::command]
 fn stop_martin_server(state: tauri::State<MartinServerState>) -> Result<(), String> {
     let mut process = state
@@ -1602,6 +2168,7 @@ fn stop_martin_server(state: tauri::State<MartinServerState>) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(not(feature = "mas"))]
 #[tauri::command]
 async fn start_geolibre_sidecar(app: tauri::AppHandle) -> Result<SidecarServerInfo, String> {
     tauri::async_runtime::spawn_blocking(move || start_geolibre_sidecar_blocking(app))
@@ -1609,6 +2176,16 @@ async fn start_geolibre_sidecar(app: tauri::AppHandle) -> Result<SidecarServerIn
         .map_err(|error| format!("Could not join sidecar startup task: {error}"))?
 }
 
+#[cfg(not(feature = "mas"))]
+fn add_main_sidecar_extras(command: &mut Command) {
+    command
+        .arg("--extra")
+        .arg("ml")
+        .arg("--extra")
+        .arg("postgis");
+}
+
+#[cfg(not(feature = "mas"))]
 fn start_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<SidecarServerInfo, String> {
     let base_url = sidecar_base_url();
     let state = app.state::<SidecarServerState>();
@@ -1668,11 +2245,13 @@ fn start_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<SidecarServe
 
     let uv = ensure_managed_uv(&app)?;
     let project_dir = sidecar_project_dir(&app)?;
-    let runtime_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Could not resolve app data directory: {error}"))?
-        .join("runtime");
+    let runtime_dir = app_runtime_dir(&app)?;
+    // A value already in the environment wins, so a desktop user who does want
+    // the allowlist can narrow it by launching the app with it set.
+    let postgis_hosts = env::var(POSTGIS_HOSTS_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| POSTGIS_HOSTS_DESKTOP_DEFAULT.to_string());
 
     let mut command = Command::new(&uv);
     command
@@ -1681,13 +2260,13 @@ fn start_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<SidecarServe
         // project directory. See the same flag in start_jupyter_server_blocking.
         .arg("--frozen")
         .arg("--project")
-        .arg(&project_dir)
-        // The AI segmentation `/ml` endpoints proxy to samgeo-api from inside
-        // this main sidecar process and need `httpx`, which lives in the `ml`
-        // extra. Unlike whitebox/conversion (separate managed venvs), ml has no
-        // lazy bootstrap, so the extra must be synced into the sidecar env here.
-        .arg("--extra")
-        .arg("ml")
+        .arg(&project_dir);
+    // The main sidecar serves both the AI segmentation proxy and editable
+    // PostGIS layers. Unlike whitebox/conversion (separate managed venvs),
+    // neither feature has a lazy bootstrap, so both extras must be synced into
+    // the sidecar environment here.
+    add_main_sidecar_extras(&mut command);
+    command
         .arg("uvicorn")
         .arg("geolibre_server.app.main:app")
         .arg("--host")
@@ -1698,6 +2277,7 @@ fn start_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<SidecarServe
         .env("GEOLIBRE_UV", &uv)
         .env("GEOLIBRE_SIDECAR_TOKEN", sidecar_token())
         .env("GEOLIBRE_RUNTIME_DIR", &runtime_dir)
+        .env(POSTGIS_HOSTS_ENV, &postgis_hosts)
         .env("UV_CACHE_DIR", runtime_dir.join("uv-cache"))
         .env("UV_PYTHON_INSTALL_DIR", runtime_dir.join("uv-python"))
         .env("UV_PROJECT_ENVIRONMENT", runtime_dir.join("sidecar-server"))
@@ -1739,6 +2319,7 @@ fn start_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<SidecarServe
     })
 }
 
+#[cfg(not(feature = "mas"))]
 #[tauri::command]
 async fn stop_geolibre_sidecar(app: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || stop_geolibre_sidecar_blocking(app))
@@ -1746,6 +2327,7 @@ async fn stop_geolibre_sidecar(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|error| format!("Could not join sidecar stop task: {error}"))?
 }
 
+#[cfg(not(feature = "mas"))]
 fn stop_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<SidecarServerState>();
     let _lifecycle = state
@@ -1782,6 +2364,7 @@ fn stop_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(feature = "mas"))]
 #[tauri::command]
 async fn start_jupyter_server(app: tauri::AppHandle) -> Result<JupyterServerInfo, String> {
     tauri::async_runtime::spawn_blocking(move || start_jupyter_server_blocking(app))
@@ -1789,6 +2372,7 @@ async fn start_jupyter_server(app: tauri::AppHandle) -> Result<JupyterServerInfo
         .map_err(|error| format!("Could not join Jupyter startup task: {error}"))?
 }
 
+#[cfg(not(feature = "mas"))]
 fn start_jupyter_server_blocking(app: tauri::AppHandle) -> Result<JupyterServerInfo, String> {
     let state = app.state::<JupyterServerState>();
     // Serialize the whole startup. Concurrent calls (e.g. React StrictMode
@@ -1829,12 +2413,14 @@ fn start_jupyter_server_blocking(app: tauri::AppHandle) -> Result<JupyterServerI
         }
     }
 
+    let runtime_dir = app_runtime_dir(&app)?;
+
     // A Jupyter server from a previous app session may still hold the port. We
     // can't reuse it (its per-launch token is unknown to us), and because we
     // spawn with `--ServerApp.port_retries=0`, a new server would fail to bind
     // and exit 1 ("exited before it was ready") while the orphan lingers. Clear
     // any stale listener and wait for the port to free before spawning.
-    let _ = terminate_jupyter_listeners_on_port(JUPYTER_PORT);
+    let _ = terminate_jupyter_listeners_on_port(JUPYTER_PORT, &runtime_dir);
     // Best-effort here: if the port never frees, the spawn below fails with
     // Jupyter's own bind error, which is already reported to the user.
     let _ = wait_for_port_free(JUPYTER_PORT);
@@ -1842,14 +2428,19 @@ fn start_jupyter_server_blocking(app: tauri::AppHandle) -> Result<JupyterServerI
     let uv = ensure_managed_uv(&app)?;
     let project_dir = sidecar_project_dir(&app)?;
     let config_path = project_dir.join("jupyter_server_config.py");
-    let runtime_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Could not resolve app data directory: {error}"))?
-        .join("runtime");
-    // Notebooks are saved here (the JupyterLab file browser root).
+    // Notebooks are saved here (the JupyterLab file browser root). Jupyter is
+    // launched with `--ServerApp.root_dir` pointing at this directory and
+    // refuses to start when it is missing, so a creation failure has to surface
+    // here. Swallowing it reached the user several steps later as an opaque
+    // "Bad config encountered during initialization: No such directory"
+    // (issue #1642).
     let notebooks_dir = runtime_dir.join("notebooks");
-    let _ = fs::create_dir_all(&notebooks_dir);
+    fs::create_dir_all(&notebooks_dir).map_err(|error| {
+        format!(
+            "Could not create the notebooks directory {}: {error}",
+            notebooks_dir.display()
+        )
+    })?;
     // Seed the starter Welcome notebook (the same one bundled into JupyterLite on
     // web) on first run only, so we never clobber a user's edits.
     let welcome_dest = notebooks_dir.join("Welcome.ipynb");
@@ -1863,8 +2454,18 @@ fn start_jupyter_server_blocking(app: tauri::AppHandle) -> Result<JupyterServerI
     // it out of the bundled backend resource into a dedicated lib dir placed on
     // the kernel's PYTHONPATH (so `import geolibre` works regardless of where the
     // notebook lives).
+    // Not fatal, unlike the notebooks root: Jupyter starts fine without this
+    // one, and losing it only costs `import geolibre` inside the notebooks. So
+    // report it rather than failing the whole panel -- but do report it, since
+    // silently discarding the result is what made #1642 so hard to read.
     let lib_dir = runtime_dir.join("notebook-lib");
-    let _ = fs::create_dir_all(&lib_dir);
+    if let Err(error) = fs::create_dir_all(&lib_dir) {
+        eprintln!(
+            "Jupyter: could not create the notebook library directory {} ({error}); \
+             `import geolibre` will not resolve in notebooks.",
+            lib_dir.display()
+        );
+    }
     let _ = fs::copy(
         project_dir.join("notebook_client.py"),
         lib_dir.join("geolibre.py"),
@@ -1954,6 +2555,7 @@ fn start_jupyter_server_blocking(app: tauri::AppHandle) -> Result<JupyterServerI
     })
 }
 
+#[cfg(not(feature = "mas"))]
 #[tauri::command]
 async fn stop_jupyter_server(app: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || stop_jupyter_server_blocking(app))
@@ -1961,6 +2563,7 @@ async fn stop_jupyter_server(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|error| format!("Could not join Jupyter stop task: {error}"))?
 }
 
+#[cfg(not(feature = "mas"))]
 fn stop_jupyter_server_blocking(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<JupyterServerState>();
     {
@@ -1977,12 +2580,35 @@ fn stop_jupyter_server_blocking(app: tauri::AppHandle) -> Result<(), String> {
     if let Ok(mut token) = state.token.lock() {
         *token = None;
     }
-    // Backstop: reap anything still bound to the port (no-op on non-unix and
-    // when nothing is listening).
-    terminate_jupyter_listeners_on_port(JUPYTER_PORT)?;
+    // Backstop: reap anything still bound to the port (no-op when nothing of
+    // ours is listening). Best-effort, because the child this call exists to
+    // clean up after is already gone by now: returning an error here would
+    // leave the frontend believing the server it just stopped is still running
+    // (stopJupyterServer only clears its state once this invoke resolves).
+    // Best-effort, but not silent: skipping the backstop is what a later
+    // "stale Jupyter still holding the port" report would trace back to.
+    match app_runtime_dir(&app) {
+        Ok(runtime_dir) => {
+            let _ = terminate_jupyter_listeners_on_port(JUPYTER_PORT, &runtime_dir);
+        }
+        Err(error) => eprintln!("Jupyter: skipping the port {JUPYTER_PORT} backstop ({error})."),
+    }
     Ok(())
 }
 
+/// Directory holding everything the app installs at runtime (the managed uv, its
+/// caches and project environments, and the notebook root). Lives under the
+/// per-user app data directory, so nothing outside it belongs to us.
+#[cfg(not(feature = "mas"))]
+fn app_runtime_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not resolve app data directory: {error}"))?
+        .join("runtime"))
+}
+
+#[cfg(not(feature = "mas"))]
 fn jupyter_base_url() -> String {
     format!("http://127.0.0.1:{JUPYTER_PORT}")
 }
@@ -1992,6 +2618,7 @@ fn jupyter_base_url() -> String {
 // enough to avoid a `--port-retries=0` bind failure right after killing an orphan.
 // Returns whether the port actually came free within the timeout, so a caller
 // that can report a better error than the failed spawn is able to bail out.
+#[cfg(not(feature = "mas"))]
 fn wait_for_port_free(port: u16) -> bool {
     for _ in 0..20 {
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
@@ -2006,6 +2633,7 @@ fn wait_for_port_free(port: u16) -> bool {
 // existing value is preserved rather than clobbered. The inherited value is
 // taken *after* AppImage sanitation, so the AppDir entry AppRun injects is not
 // carried into the child (see appdir_free_path_var).
+#[cfg(not(feature = "mas"))]
 fn prepend_pythonpath(dir: &Path) -> String {
     let dir = dir.display().to_string();
     match appdir_free_path_var("PYTHONPATH") {
@@ -2017,6 +2645,7 @@ fn prepend_pythonpath(dir: &Path) -> String {
     }
 }
 
+#[cfg(not(feature = "mas"))]
 fn jupyter_health_is_ready(
     client: &reqwest::blocking::Client,
     base_url: &str,
@@ -2030,6 +2659,7 @@ fn jupyter_health_is_ready(
         .unwrap_or(false)
 }
 
+#[cfg(not(feature = "mas"))]
 fn wait_for_jupyter_health(
     base_url: &str,
     token: &str,
@@ -2072,6 +2702,7 @@ fn wait_for_jupyter_health(
 // there is no terminal to read it from, so it has to travel with the error.
 // Shared by the Jupyter and sidecar waiters, and by both of their failure paths
 // (early exit and timeout), so no path can quietly drop the one useful detail.
+#[cfg(not(feature = "mas"))]
 fn child_failure_message(summary: &str, output: &CapturedOutput) -> String {
     // The child may have only just exited, with its last lines still in flight.
     output.settle();
@@ -2087,6 +2718,7 @@ fn child_failure_message(summary: &str, output: &CapturedOutput) -> String {
 // only barrier once the XSRF check is disabled for the embedded iframe (see
 // jupyter_server_config.py), so use the OS CSPRNG (128 random bits) rather than
 // anything derived from the clock/pid.
+#[cfg(not(feature = "mas"))]
 fn generate_jupyter_token() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("OS CSPRNG (getrandom) unavailable");
@@ -2098,6 +2730,7 @@ fn generate_jupyter_token() -> String {
     token
 }
 
+#[cfg(not(feature = "mas"))]
 fn sidecar_base_url() -> String {
     format!("http://127.0.0.1:{SIDECAR_PORT}")
 }
@@ -2112,11 +2745,13 @@ fn sidecar_base_url() -> String {
 /// via `GEOLIBRE_SIDECAR_TOKEN` at spawn time. A sidecar started outside this
 /// process (e.g. a `python -m` dev run) leaves the env var unset and simply does
 /// not enforce the token, so those flows keep working.
+#[cfg(not(feature = "mas"))]
 fn sidecar_token() -> &'static str {
     static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TOKEN.get_or_init(generate_jupyter_token)
 }
 
+#[cfg(not(feature = "mas"))]
 fn sidecar_health_is_ready(base_url: &str) -> bool {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(500))
@@ -2140,6 +2775,7 @@ fn sidecar_health_is_ready(base_url: &str) -> bool {
 /// than silently 401ing every later request. A tokenless dev sidecar
 /// (`GEOLIBRE_SIDECAR_TOKEN` unset) accepts any header and returns 200, so it is
 /// still reused.
+#[cfg(not(feature = "mas"))]
 fn sidecar_accepts_token(base_url: &str, token: &str) -> bool {
     let Ok(client) = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(500))
@@ -2155,6 +2791,7 @@ fn sidecar_accepts_token(base_url: &str, token: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(feature = "mas"))]
 fn request_sidecar_shutdown(base_url: &str) {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(500))
@@ -2171,6 +2808,7 @@ fn request_sidecar_shutdown(base_url: &str) {
     }
 }
 
+#[cfg(not(feature = "mas"))]
 fn wait_for_sidecar_stop(base_url: &str) {
     for _ in 0..20 {
         if !sidecar_health_is_ready(base_url) {
@@ -2180,6 +2818,7 @@ fn wait_for_sidecar_stop(base_url: &str) {
     }
 }
 
+#[cfg(not(feature = "mas"))]
 fn wait_for_sidecar_health(
     base_url: &str,
     child: &mut Child,
@@ -2213,7 +2852,9 @@ fn wait_for_sidecar_health(
 // failure message quotes. The log is a ring buffer so a chatty child (uv sync +
 // JupyterLab startup write hundreds of lines) can never grow without bound, and
 // the tail is what matters: the error that killed the process is at the end.
+#[cfg(not(feature = "mas"))]
 const CAPTURED_LOG_MAX_LINES: usize = 200;
+#[cfg(not(feature = "mas"))]
 const CAPTURED_LOG_REPORTED_LINES: usize = 20;
 // How long a failure report waits for the reader threads to reach EOF before
 // quoting what they have. `try_wait` reports the exit as soon as the process is
@@ -2223,7 +2864,9 @@ const CAPTURED_LOG_REPORTED_LINES: usize = 20;
 // inherit these same pipe handles, so a grandchild outliving the child keeps the
 // write end open and EOF never arrives. An unbounded join would hang the Tauri
 // command forever, which is worse than a truncated tail.
+#[cfg(not(feature = "mas"))]
 const CAPTURED_LOG_SETTLE: Duration = Duration::from_millis(500);
+#[cfg(not(feature = "mas"))]
 const CAPTURED_LOG_SETTLE_POLL: Duration = Duration::from_millis(10);
 
 /// The trailing output of a spawned child, drained on background threads.
@@ -2234,6 +2877,7 @@ const CAPTURED_LOG_SETTLE_POLL: Duration = Duration::from_millis(10);
 /// streams continuously, keep the last `CAPTURED_LOG_MAX_LINES` in memory, and
 /// echo each line to the parent's own stdio so a dev terminal still shows the
 /// live log.
+#[cfg(not(feature = "mas"))]
 #[derive(Clone)]
 struct CapturedOutput {
     lines: Arc<Mutex<VecDeque<String>>>,
@@ -2241,6 +2885,7 @@ struct CapturedOutput {
     draining: Arc<AtomicUsize>,
 }
 
+#[cfg(not(feature = "mas"))]
 impl CapturedOutput {
     fn new() -> Self {
         Self {
@@ -2333,6 +2978,7 @@ impl CapturedOutput {
 
 /// The AppImage mount root, when running from an AppImage. `APPDIR` is exported
 /// by AppRun and is the prefix of everything it injects.
+#[cfg(not(feature = "mas"))]
 fn appimage_dir() -> Option<String> {
     env::var("APPDIR").ok().filter(|dir| !dir.is_empty())
 }
@@ -2341,6 +2987,7 @@ fn appimage_dir() -> Option<String> {
 /// mount removed. Returns `None` when the variable is unset or every entry was
 /// an AppDir entry (so the caller unsets it rather than passing an empty value).
 /// Outside an AppImage the value is returned untouched.
+#[cfg(not(feature = "mas"))]
 fn appdir_free_path_var(name: &str) -> Option<String> {
     let value = env::var(name).ok()?;
     let Some(appdir) = appimage_dir() else {
@@ -2380,6 +3027,7 @@ fn appdir_free_path_var(name: &str) -> Option<String> {
 /// the project environment we point it at, so drop it unconditionally rather
 /// than only under an AppImage. The two search paths keep any entries the user
 /// legitimately set and lose only the AppDir ones.
+#[cfg(not(feature = "mas"))]
 fn clear_appimage_python_env(command: &mut Command) {
     command.env_remove("PYTHONHOME");
     for name in ["LD_LIBRARY_PATH", "PYTHONPATH"] {
@@ -2399,29 +3047,54 @@ fn clear_appimage_python_env(command: &mut Command) {
     }
 }
 
+#[cfg(not(feature = "mas"))]
 fn configure_sidecar_process(command: &mut Command) {
     // Both callers (the sidecar and Jupyter launches) run Python through uv.
     clear_appimage_python_env(command);
     configure_sidecar_process_impl(command);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "mas")))]
 fn configure_sidecar_process_impl(command: &mut Command) {
     use std::os::unix::process::CommandExt;
 
     command.process_group(0);
 }
 
-#[cfg(not(unix))]
-fn configure_sidecar_process_impl(_command: &mut Command) {}
+#[cfg(all(not(unix), not(feature = "mas")))]
+fn configure_sidecar_process_impl(command: &mut Command) {
+    hide_console_window(command);
+}
 
+/// Keep a spawned console program from opening a console window.
+///
+/// Release builds are GUI-subsystem (`windows_subsystem = "windows"`), so they
+/// have no console of their own. Spawning `uv.exe` (a console program) then
+/// makes Windows allocate a fresh console *window* for it, which appears on the
+/// user's desktop and stays for as long as the child runs -- for the Notebook
+/// panel that is the whole session. `CREATE_NO_WINDOW` runs the child without
+/// one. Output is unaffected: every caller already pipes stdout/stderr and
+/// drains them (see CapturedOutput).
+#[cfg(all(target_os = "windows", not(feature = "mas")))]
+fn hide_console_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(all(not(target_os = "windows"), not(feature = "mas")))]
+fn hide_console_window(_command: &mut Command) {}
+
+#[cfg(not(feature = "mas"))]
 fn terminate_sidecar_child(child: &mut Child) {
     terminate_sidecar_process_group(child);
     let _ = child.kill();
     let _ = child.wait();
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "mas")))]
 fn terminate_sidecar_process_group(child: &mut Child) {
     // Guard the negation: a PID that wrapped to a non-positive i32 would make
     // `kill` target process group 0 (the caller's own group, including the
@@ -2438,10 +3111,10 @@ fn terminate_sidecar_process_group(child: &mut Child) {
     let _ = unsafe { kill(process_group, SIGKILL) };
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(feature = "mas")))]
 fn terminate_sidecar_process_group(_child: &mut Child) {}
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "mas")))]
 fn terminate_sidecar_listeners_on_port(port: u16) -> Result<(), String> {
     terminate_listeners_on_port(port, is_geolibre_sidecar_process)
 }
@@ -2449,26 +3122,279 @@ fn terminate_sidecar_listeners_on_port(port: u16) -> Result<(), String> {
 // Reap a stale Jupyter server that still holds the port (e.g. orphaned by a
 // non-graceful exit of a previous app session). Recognized by its cmdline so we
 // never touch an unrelated jupyter (the user's own JupyterHub, etc.).
-#[cfg(target_os = "linux")]
-fn terminate_jupyter_listeners_on_port(port: u16) -> Result<(), String> {
+#[cfg(all(target_os = "linux", not(feature = "mas")))]
+fn terminate_jupyter_listeners_on_port(
+    port: u16,
+    _runtime_dir: &std::path::Path,
+) -> Result<(), String> {
     terminate_listeners_on_port(port, is_geolibre_jupyter_process)
 }
 
-// Known gap: this is a no-op on macOS/Windows (the /proc-based listener lookup is
-// Linux-only). The current session's child is still reaped on exit via
-// JupyterProcess::Drop, but an orphan left by a *previous* crashed session can
-// keep holding the port there, in which case the next launch fails to bind and
-// surfaces "exited before it was ready". A cross-platform port-owner lookup
-// (e.g. lsof on macOS) would be needed to close this.
-#[cfg(not(target_os = "linux"))]
-fn terminate_jupyter_listeners_on_port(_port: u16) -> Result<(), String> {
+// Known gap: still a no-op on macOS (there is no /proc, and the Windows IP
+// Helper route below does not exist either). The current session's child is
+// reaped on exit via JupyterProcess::Drop, but an orphan left by a *previous*
+// crashed session can keep holding the port, in which case the next launch
+// fails to bind and surfaces "exited before it was ready". An lsof-based
+// port-owner lookup would be needed to close this.
+#[cfg(all(
+    not(target_os = "linux"),
+    not(target_os = "windows"),
+    not(feature = "mas")
+))]
+fn terminate_jupyter_listeners_on_port(
+    _port: u16,
+    _runtime_dir: &std::path::Path,
+) -> Result<(), String> {
     Ok(())
+}
+
+// Windows equivalent of the Linux reaper (issue #1643): an orphaned Jupyter
+// server from a crashed session keeps holding 8766, and every later launch dies
+// with "the port 8766 is already in use" until the user kills it by hand.
+//
+// There is no /proc here, so the owner of the listening socket comes from the IP
+// Helper TCP table, and "is it ours?" is answered by the process image path: we
+// only ever terminate a listener whose executable lives inside this user's own
+// GeoLibre runtime directory (the uv-managed environment under
+// `%APPDATA%\org.geolibre.desktop\runtime\`). A Jupyter the user installed
+// themselves lives outside it and is left alone. The sidecar's port keeps its
+// no-op: unlike Jupyter it already reports an actionable message of its own
+// when the port stays busy (see start_geolibre_sidecar_blocking).
+#[cfg(all(target_os = "windows", not(feature = "mas")))]
+fn terminate_jupyter_listeners_on_port(
+    port: u16,
+    runtime_dir: &std::path::Path,
+) -> Result<(), String> {
+    for pid in listening_tcp_pids(port) {
+        terminate_listener_under(pid, runtime_dir);
+    }
+    Ok(())
+}
+
+// PIDs of the processes listening on `port`, over both IPv4 and IPv6. The two
+// families are read independently: a machine with IPv6 disabled outright can
+// fail the second read, and letting that discard the IPv4 result would drop the
+// orphan we are here to reclaim (Jupyter binds 127.0.0.1, so it is nearly
+// always the IPv4 table that holds it).
+#[cfg(all(target_os = "windows", not(feature = "mas")))]
+fn listening_tcp_pids(port: u16) -> HashSet<u32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID,
+    };
+
+    // The address families as GetExtendedTcpTable wants them: a plain u32, not
+    // the u16 `ADDRESS_FAMILY` the WinSock module exports.
+    const AF_INET: u32 = 2;
+    const AF_INET6: u32 = 23;
+
+    let mut pids = HashSet::new();
+    match extended_tcp_table(AF_INET) {
+        Ok(table) => collect_owner_pids::<MIB_TCPROW_OWNER_PID>(
+            &table,
+            port,
+            |row| (row.dwLocalPort, row.dwOwningPid),
+            &mut pids,
+        ),
+        Err(error) => eprintln!("Jupyter: {error}"),
+    }
+    match extended_tcp_table(AF_INET6) {
+        Ok(table) => collect_owner_pids::<MIB_TCP6ROW_OWNER_PID>(
+            &table,
+            port,
+            |row| (row.dwLocalPort, row.dwOwningPid),
+            &mut pids,
+        ),
+        Err(error) => eprintln!("Jupyter: {error}"),
+    }
+    pids
+}
+
+// Walk one MIB_TCP*TABLE_OWNER_PID and collect the PIDs listening on `port`.
+// Both the IPv4 and IPv6 tables have the same shape -- a DWORD entry count
+// followed by the rows -- so the row type and the two fields we need are the
+// only things that differ.
+#[cfg(all(target_os = "windows", not(feature = "mas")))]
+fn collect_owner_pids<Row>(
+    buffer: &[u32],
+    port: u16,
+    fields: fn(&Row) -> (u32, u32),
+    pids: &mut HashSet<u32>,
+) {
+    use std::mem::{size_of, size_of_val};
+
+    if buffer.is_empty() {
+        return;
+    }
+    let base = buffer.as_ptr();
+    // SAFETY: `buffer` is a u32-aligned allocation that GetExtendedTcpTable
+    // filled for this table class, and it holds at least the leading entry
+    // count. Every row type here has 4-byte alignment, so the rows -- which
+    // start one DWORD in -- are aligned too. The walk is capped at the number
+    // of rows the allocation can actually hold, so an entry count that
+    // disagrees with the reported size cannot read past the end.
+    let count = unsafe { *base } as usize;
+    let capacity = (size_of_val(buffer) - size_of::<u32>()) / size_of::<Row>();
+    let rows = unsafe { base.add(1) }.cast::<Row>();
+    for index in 0..count.min(capacity) {
+        let (local_port, owning_pid) = fields(unsafe { &*rows.add(index) });
+        if tcp_table_port(local_port) == port {
+            pids.insert(owning_pid);
+        }
+    }
+}
+
+// Read the TCP listener table for one address family into a u32-aligned buffer.
+// GetExtendedTcpTable reports the size it needs on the first (null) call, but
+// the table can grow between that call and the read, so retry a bounded number
+// of times rather than trusting the first answer.
+#[cfg(all(target_os = "windows", not(feature = "mas")))]
+fn extended_tcp_table(family: u32) -> Result<Vec<u32>, String> {
+    use std::mem::size_of;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, TCP_TABLE_OWNER_PID_LISTENER,
+    };
+
+    const NO_ERROR: u32 = 0;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    const ATTEMPTS: usize = 8;
+
+    let mut size: u32 = 0;
+    let mut buffer: Vec<u32> = Vec::new();
+    for _ in 0..ATTEMPTS {
+        // SAFETY: the pointer and `size` describe the same allocation (null and
+        // zero on the sizing call, which is what the API asks for), and the API
+        // only writes within `size` bytes.
+        let result = unsafe {
+            GetExtendedTcpTable(
+                if buffer.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    buffer.as_mut_ptr().cast()
+                },
+                &mut size,
+                0, // unsorted: we look up a single port
+                family,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        match result {
+            NO_ERROR => return Ok(buffer),
+            ERROR_INSUFFICIENT_BUFFER => {
+                if size == 0 {
+                    return Ok(Vec::new());
+                }
+                buffer = vec![0u32; (size as usize).div_ceil(size_of::<u32>())];
+            }
+            other => {
+                return Err(format!(
+                    "Could not read the TCP listener table for address family {family}: \
+                     Windows error {other}."
+                ))
+            }
+        }
+    }
+    Err("Could not read the TCP listener table: it kept growing between calls.".to_string())
+}
+
+// Terminate `pid`, but only if its executable lives inside `runtime_dir`. Does
+// nothing when the process has already exited or we may not touch it.
+//
+// The image check and the kill deliberately share ONE handle. An open handle
+// pins the process object, so the PID cannot be recycled onto some unrelated
+// process in between -- re-opening by PID to terminate would leave exactly that
+// window, and the whole point of the image check is that we never kill a
+// process that is not ours.
+//
+// Windows has no SIGTERM, so unlike the Linux path there is no graceful step to
+// try first: an orphan from a previous session has no channel we can ask it to
+// shut down through.
+#[cfg(all(target_os = "windows", not(feature = "mas")))]
+fn terminate_listener_under(pid: u32, runtime_dir: &Path) {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    // SAFETY: one handle for both the query and the kill; closed on every path.
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            0,
+            pid,
+        )
+    };
+    if process.is_null() {
+        return;
+    }
+    // Sized for an extended-length path rather than MAX_PATH, so a deeply
+    // nested app-data directory is not silently truncated into a non-match.
+    let mut buffer = vec![0u16; 32_768];
+    let mut length = buffer.len() as u32;
+    // SAFETY: `buffer` holds `length` u16s; on success the API sets `length` to
+    // the number it wrote, which is never more than the value passed in.
+    let queried = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            buffer.as_mut_ptr(),
+            &mut length,
+        )
+    };
+    if queried != 0 {
+        let image = PathBuf::from(OsString::from_wide(
+            &buffer[..(length as usize).min(buffer.len())],
+        ));
+        if path_is_under(&image, runtime_dir) {
+            // SAFETY: the same handle, opened with PROCESS_TERMINATE above.
+            let _ = unsafe { TerminateProcess(process, 1) };
+        }
+    }
+    let _ = unsafe { CloseHandle(process) };
+}
+
+// MIB_TCP*ROW_OWNER_PID keeps the local port in the low word of a DWORD, in
+// network byte order.
+#[cfg(any(all(target_os = "windows", not(feature = "mas")), test))]
+fn tcp_table_port(value: u32) -> u16 {
+    u16::from_be((value & 0xFFFF) as u16)
+}
+
+// Whether `path` sits inside `root`. Compared with separators normalized and
+// case folded, because Windows paths are case-insensitive and the image path
+// the OS reports need not spell the directory the way we built it. The trailing
+// separator is what keeps `...\runtime` from matching `...\runtime-old`.
+//
+// Folding is ASCII-only on purpose. What actually varies between the path we
+// built and the one the OS reports is the drive letter and the segments we
+// wrote ourselves, all ASCII; the rest (a user's name in the profile path) is
+// byte-identical on both sides. Unicode `to_lowercase` would buy nothing there
+// and can change a string's length (Turkish dotless I, sharp S), which would
+// misalign the prefix comparison.
+#[cfg(any(all(target_os = "windows", not(feature = "mas")), test))]
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    fn normalize(value: &Path) -> String {
+        value
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_ascii_lowercase()
+    }
+
+    let root = normalize(root);
+    let root = root.trim_end_matches('\\');
+    if root.is_empty() {
+        return false;
+    }
+    normalize(path).starts_with(&format!("{root}\\"))
 }
 
 // Kill the processes listening on `port` that `is_ours` recognizes (SIGTERM then
 // SIGKILL). The `is_ours` guard prevents killing an unrelated process that
 // happens to hold the port.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "mas")))]
 fn terminate_listeners_on_port(port: u16, is_ours: fn(i32) -> bool) -> Result<(), String> {
     let inodes = listening_tcp_inodes(port)?;
     if inodes.is_empty() {
@@ -2500,12 +3426,12 @@ fn terminate_listeners_on_port(port: u16, is_ours: fn(i32) -> bool) -> Result<()
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(feature = "mas")))]
 fn terminate_sidecar_listeners_on_port(_port: u16) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "mas")))]
 fn listening_tcp_inodes(port: u16) -> Result<HashSet<String>, String> {
     let mut inodes = HashSet::new();
     collect_listening_tcp_inodes("/proc/net/tcp", port, &mut inodes)?;
@@ -2513,7 +3439,7 @@ fn listening_tcp_inodes(port: u16) -> Result<HashSet<String>, String> {
     Ok(inodes)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "mas")))]
 fn collect_listening_tcp_inodes(
     path: &str,
     port: u16,
@@ -2537,7 +3463,7 @@ fn collect_listening_tcp_inodes(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "mas")))]
 fn process_has_socket(pid: i32, inodes: &HashSet<String>) -> Result<bool, String> {
     let fd_dir = format!("/proc/{pid}/fd");
     let Ok(entries) = fs::read_dir(&fd_dir) else {
@@ -2563,7 +3489,7 @@ fn process_has_socket(pid: i32, inodes: &HashSet<String>) -> Result<bool, String
     Ok(false)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "mas")))]
 fn is_geolibre_sidecar_process(pid: i32) -> bool {
     let path = format!("/proc/{pid}/cmdline");
     let Ok(command_line) = fs::read(path) else {
@@ -2577,7 +3503,7 @@ fn is_geolibre_sidecar_process(pid: i32) -> bool {
 // Recognize OUR Jupyter server (started by start_jupyter_server) by the bundled
 // config path on its command line — specific enough not to match the user's own
 // jupyter/JupyterHub processes.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "mas")))]
 fn is_geolibre_jupyter_process(pid: i32) -> bool {
     let path = format!("/proc/{pid}/cmdline");
     let Ok(command_line) = fs::read(path) else {
@@ -2587,11 +3513,12 @@ fn is_geolibre_jupyter_process(pid: i32) -> bool {
     command_line.contains("jupyter_server_config.py") && command_line.contains("geolibre_server")
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "mas")))]
 fn terminate_pid(pid: i32, signal: i32) {
     let _ = unsafe { kill(pid, signal) };
 }
 
+#[cfg(not(feature = "mas"))]
 fn sidecar_project_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     if let Ok(path) = env::var("GEOLIBRE_SIDECAR_PROJECT_DIR") {
         return validate_sidecar_project_dir(PathBuf::from(path));
@@ -2622,6 +3549,7 @@ fn sidecar_project_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 /// under the resource dir (issue #1223). We probe the plain locations first,
 /// then a few `_up_` depths so the lookup keeps working if the number of `..`
 /// segments in the resource path ever changes.
+#[cfg(not(feature = "mas"))]
 fn resolve_sidecar_in_resource_dir(resource_dir: &std::path::Path) -> Option<PathBuf> {
     // Plain resource root plus a few `_up_` levels of margin over the observed
     // 3-level bundle depth, so the lookup survives a change in Tauri's bundling.
@@ -2641,6 +3569,7 @@ fn resolve_sidecar_in_resource_dir(resource_dir: &std::path::Path) -> Option<Pat
     None
 }
 
+#[cfg(not(feature = "mas"))]
 fn validate_sidecar_project_dir(path: PathBuf) -> Result<PathBuf, String> {
     let path = path
         .canonicalize()
@@ -2655,6 +3584,7 @@ fn validate_sidecar_project_dir(path: PathBuf) -> Result<PathBuf, String> {
     }
 }
 
+#[cfg(not(feature = "mas"))]
 fn ensure_managed_uv(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     if let Ok(path) = env::var("GEOLIBRE_UV") {
         let path = PathBuf::from(path);
@@ -2670,13 +3600,9 @@ fn ensure_managed_uv(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     install_managed_uv(app)
 }
 
+#[cfg(not(feature = "mas"))]
 fn install_managed_uv(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let uv_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Could not resolve app data directory: {error}"))?
-        .join("runtime")
-        .join("uv-bin");
+    let uv_dir = app_runtime_dir(app)?.join("uv-bin");
     let uv = uv_dir.join(uv_executable_name());
     if uv.exists() {
         return Ok(uv);
@@ -2699,6 +3625,9 @@ fn install_managed_uv(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         command.arg(&script);
         command
     };
+    // First run only, but it is the one that would flash a PowerShell window
+    // across the user's desktop while uv installs.
+    hide_console_window(&mut command);
     let output = command
         .env("UV_UNMANAGED_INSTALL", &uv_dir)
         .output()
@@ -2718,6 +3647,7 @@ fn install_managed_uv(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(uv)
 }
 
+#[cfg(not(feature = "mas"))]
 fn download_uv_installer(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let url = if cfg!(target_os = "windows") {
         format!("{UV_INSTALL_BASE_URL}/install.ps1")
@@ -2758,6 +3688,7 @@ fn download_uv_installer(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(script)
 }
 
+#[cfg(not(feature = "mas"))]
 fn uv_executable_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "uv.exe"
@@ -2766,6 +3697,7 @@ fn uv_executable_name() -> &'static str {
     }
 }
 
+#[cfg(not(feature = "mas"))]
 fn find_executable_on_path(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     env::split_paths(&path)
@@ -2773,7 +3705,7 @@ fn find_executable_on_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file() && is_executable(candidate))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "mas")))]
 fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
@@ -2781,11 +3713,12 @@ fn is_executable(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(feature = "mas")))]
 fn is_executable(_path: &std::path::Path) -> bool {
     true
 }
 
+#[cfg(not(feature = "mas"))]
 fn ensure_martin_binary_path(app: &tauri::AppHandle) -> Result<MartinBinaryInfo, String> {
     let asset_name = martin_asset_name()?;
     let executable_name = martin_executable_name();
@@ -2831,6 +3764,7 @@ fn ensure_martin_binary_path(app: &tauri::AppHandle) -> Result<MartinBinaryInfo,
     })
 }
 
+#[cfg(not(feature = "mas"))]
 fn martin_asset_name() -> Result<&'static str, String> {
     if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
         return Ok("martin-x86_64-unknown-linux-musl.tar.gz");
@@ -2851,6 +3785,7 @@ fn martin_asset_name() -> Result<&'static str, String> {
     Err("No Martin binary release is available for this platform.".to_string())
 }
 
+#[cfg(not(feature = "mas"))]
 fn martin_executable_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "martin.exe"
@@ -2859,6 +3794,7 @@ fn martin_executable_name() -> &'static str {
     }
 }
 
+#[cfg(not(feature = "mas"))]
 fn download_martin_asset(asset_name: &str) -> Result<Vec<u8>, String> {
     let url = format!("{MARTIN_RELEASE_BASE_URL}/{MARTIN_VERSION}/{asset_name}");
     let response = reqwest::blocking::Client::builder()
@@ -2879,6 +3815,7 @@ fn download_martin_asset(asset_name: &str) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("Could not read Martin download: {error}"))
 }
 
+#[cfg(not(feature = "mas"))]
 fn extract_martin_binary(
     archive: &[u8],
     asset_name: &str,
@@ -2891,6 +3828,7 @@ fn extract_martin_binary(
     }
 }
 
+#[cfg(not(feature = "mas"))]
 fn extract_martin_binary_from_tar_gz(archive: &[u8], binary_path: &Path) -> Result<(), String> {
     let decoder = GzDecoder::new(Cursor::new(archive));
     let mut archive = tar::Archive::new(decoder);
@@ -2915,6 +3853,7 @@ fn extract_martin_binary_from_tar_gz(archive: &[u8], binary_path: &Path) -> Resu
     Err("Martin archive did not contain the expected executable.".to_string())
 }
 
+#[cfg(not(feature = "mas"))]
 fn extract_martin_binary_from_zip(archive: &[u8], binary_path: &Path) -> Result<(), String> {
     let reader = Cursor::new(archive);
     let mut archive = zip::ZipArchive::new(reader)
@@ -2937,6 +3876,7 @@ fn extract_martin_binary_from_zip(archive: &[u8], binary_path: &Path) -> Result<
     Err("Martin zip did not contain the expected executable.".to_string())
 }
 
+#[cfg(not(feature = "mas"))]
 fn copy_archive_entry_to_path<R: Read>(reader: &mut R, path: &Path) -> Result<(), String> {
     let mut output =
         File::create(path).map_err(|error| format!("Could not create Martin binary: {error}"))?;
@@ -2947,7 +3887,7 @@ fn copy_archive_entry_to_path<R: Read>(reader: &mut R, path: &Path) -> Result<()
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "mas")))]
 fn make_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -2959,17 +3899,19 @@ fn make_executable(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("Could not mark Martin executable: {error}"))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(feature = "mas")))]
 fn make_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(feature = "mas"))]
 struct SpawnedMartinServer {
     base_url: String,
     port: u16,
     process: MartinProcess,
 }
 
+#[cfg(not(feature = "mas"))]
 fn spawn_martin_server(
     binary_path: &str,
     connection_string: &str,
@@ -2999,6 +3941,10 @@ fn spawn_martin_server(
         command.env("DEFAULT_SRID", default_srid);
     }
 
+    // Martin is a console program too, and it runs for as long as the PostGIS
+    // connection is open.
+    hide_console_window(&mut command);
+
     drop(listener);
     let mut child = command
         .spawn()
@@ -3020,6 +3966,7 @@ fn spawn_martin_server(
     })
 }
 
+#[cfg(not(feature = "mas"))]
 fn wait_for_martin_health(base_url: &str, child: &mut Child) -> Result<(), String> {
     let health_url = format!("{base_url}/health");
     let client = reqwest::blocking::Client::builder()
@@ -3055,6 +4002,7 @@ fn wait_for_martin_health(base_url: &str, child: &mut Child) -> Result<(), Strin
     Err("Martin did not become ready in time.".to_string())
 }
 
+#[cfg(not(feature = "mas"))]
 fn read_child_output(child: &mut Child) -> String {
     let mut output = String::new();
     if let Some(mut stdout) = child.stdout.take() {
@@ -3084,6 +4032,17 @@ struct MbtilesMetadata {
 fn read_mbtiles_metadata(path: String) -> Result<MbtilesMetadata, String> {
     let connection = open_mbtiles(&path)?;
     let metadata = read_metadata_rows(&connection)?;
+    let metadata_min_zoom = metadata
+        .get("minzoom")
+        .and_then(|value| value.parse::<i64>().ok());
+    let metadata_max_zoom = metadata
+        .get("maxzoom")
+        .and_then(|value| value.parse::<i64>().ok());
+    let (tile_min_zoom, tile_max_zoom) = read_mbtiles_zoom_range(
+        &connection,
+        metadata_min_zoom.is_none(),
+        metadata_max_zoom.is_none(),
+    )?;
     let fallback_name = Path::new(&path)
         .file_stem()
         .and_then(|name| name.to_str())
@@ -3108,12 +4067,8 @@ fn read_mbtiles_metadata(path: String) -> Result<MbtilesMetadata, String> {
         format,
         tile_type,
         source_layers: read_vector_source_layers(metadata.get("json")),
-        min_zoom: metadata
-            .get("minzoom")
-            .and_then(|value| value.parse::<i64>().ok()),
-        max_zoom: metadata
-            .get("maxzoom")
-            .and_then(|value| value.parse::<i64>().ok()),
+        min_zoom: metadata_min_zoom.or(tile_min_zoom),
+        max_zoom: metadata_max_zoom.or(tile_max_zoom),
         bounds: metadata.get("bounds").and_then(|value| parse_bounds(value)),
         center: metadata.get("center").and_then(|value| parse_center(value)),
         scheme: metadata
@@ -3121,6 +4076,26 @@ fn read_mbtiles_metadata(path: String) -> Result<MbtilesMetadata, String> {
             .map(|value| value.to_ascii_lowercase())
             .unwrap_or_else(|| "tms".to_string()),
     })
+}
+
+fn read_mbtiles_zoom_range(
+    connection: &Connection,
+    need_min: bool,
+    need_max: bool,
+) -> Result<(Option<i64>, Option<i64>), String> {
+    let read = |aggregate: &str| {
+        connection
+            .query_row(
+                &format!("SELECT {aggregate}(zoom_level) FROM tiles"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Could not read MBTiles zoom range: {error}"))
+    };
+    Ok((
+        if need_min { read("MIN")? } else { None },
+        if need_max { read("MAX")? } else { None },
+    ))
 }
 
 #[tauri::command]
@@ -3328,15 +4303,121 @@ fn create_oauth_popup_window(
 }
 
 #[cfg(target_os = "linux")]
+fn nvidia_is_primary_gpu(drm_root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(drm_root) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("card") || name.contains('-') {
+            return false;
+        }
+        let device = entry.path().join("device");
+        fs::read_to_string(device.join("vendor"))
+            .is_ok_and(|vendor| vendor.trim().eq_ignore_ascii_case("0x10de"))
+            && fs::read_to_string(device.join("boot_vga"))
+                .is_ok_and(|boot_vga| boot_vga.trim() == "1")
+            && fs::read_link(device.join("driver")).is_ok_and(|driver| {
+                driver
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("nvidia"))
+            })
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_uses_nvidia_renderer(
+    drm_root: &Path,
+    prime_offload: Option<&std::ffi::OsStr>,
+    glx_vendor: Option<&std::ffi::OsStr>,
+) -> bool {
+    prime_offload.is_some_and(|value| value != "0")
+        || glx_vendor.is_some_and(|value| value.eq_ignore_ascii_case("nvidia"))
+        || nvidia_is_primary_gpu(drm_root)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum LinuxDmabufWorkaround {
+    Disable,
+    ForceShm,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_dmabuf_workaround(
+    webkit_version: (u32, u32),
+    uses_nvidia: bool,
+) -> Option<LinuxDmabufWorkaround> {
+    if webkit_version < (2, 48) || (uses_nvidia && webkit_version < (2, 52)) {
+        Some(LinuxDmabufWorkaround::Disable)
+    } else if uses_nvidia {
+        Some(LinuxDmabufWorkaround::ForceShm)
+    } else {
+        None
+    }
+}
+
+/// JavaScriptCore options that keep WebKitGTK's WebAssembly tier-up off its
+/// OSR-entry path (see `configure_linux_webkit`). Both are needed: the first
+/// covers OSR entry out of the WebAssembly interpreter, the second the loop
+/// tier-up checks the baseline (BBQ) JIT emits. Leaving either on still
+/// reaches the trampoline.
+#[cfg(target_os = "linux")]
+const WASM_OSR_ENTRY_JSC_OPTIONS: [&str; 2] = ["JSC_useWasmOSR", "JSC_useBBQTierUpChecks"];
+
+/// Whether this CPU implements AVX. The trampoline behind GeoLibre#2087 is
+/// x86-only, so every other architecture answers yes and skips the workaround.
+#[cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))]
+fn cpu_supports_avx() -> bool {
+    std::arch::is_x86_feature_detected!("avx")
+}
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86", target_arch = "x86_64"))
+))]
+fn cpu_supports_avx() -> bool {
+    true
+}
+
+/// Whether an explicit value for one of `WASM_OSR_ENTRY_JSC_OPTIONS` leaves it
+/// off. JavaScriptCore reads `false`, `no` (either in any case) and `0` as off
+/// and `true`, `yes` and `1` as on, and keeps the option's default, which for
+/// both of these is on, for anything it cannot parse. Answer the way it does
+/// rather than treating "set" as "off".
+#[cfg(target_os = "linux")]
+fn jsc_option_is_off(value: &std::ffi::OsStr) -> bool {
+    value.to_str().is_some_and(|value| {
+        value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("no") || value == "0"
+    })
+}
+
+/// Whether `WASM_OSR_ENTRY_JSC_OPTIONS` has to be pinned off, given whether the
+/// CPU supports AVX and whether either option is explicitly *on*. The two are
+/// one decision, not two: leaving half the pair applied costs WebAssembly
+/// performance without keeping the renderer alive. So an option somebody has
+/// already turned off is fine to build on (the other half still gets applied),
+/// while an option somebody has turned on is the escape hatch and takes the
+/// whole workaround out of GeoLibre's hands, as does pinning `JSC_useBBQJIT`
+/// instead.
+#[cfg(target_os = "linux")]
+fn linux_needs_wasm_osr_workaround(cpu_supports_avx: bool, opted_out: bool) -> bool {
+    !cpu_supports_avx && !opted_out
+}
+
+#[cfg(target_os = "linux")]
 fn configure_linux_webkit() {
     // WebKitGTK's DMABUF renderer could fail to allocate GBM buffers on older
     // graphics stacks, leaving the Tauri window blank, so it used to be
     // disabled here unconditionally. Disabling it also forces a slow readback
     // compositing path that visibly drops MapLibre pan/zoom FPS, and the
-    // allocation bugs are fixed in current WebKitGTK, so keep the workaround
-    // only for versions older than 2.48. An explicit user/distributor value
-    // always wins (per WebKit semantics, "0" keeps DMABUF on and any other
-    // value disables it). Only set the default when unset.
+    // allocation bugs are fixed on most current graphics stacks. Nvidia's GBM
+    // allocation still fails on current drivers, but WebKitGTK 2.52 added a
+    // modern shared-memory fallback that avoids both the blank window and the
+    // slow legacy renderer selected by WEBKIT_DISABLE_DMABUF_RENDERER. Keep the
+    // legacy escape hatch for older WebKitGTK. An explicit user/distributor
+    // value always wins.
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
         let webkit_version = unsafe {
             (
@@ -3344,10 +4425,70 @@ fn configure_linux_webkit() {
                 webkit2gtk_sys::webkit_get_minor_version(),
             )
         };
-        if webkit_version < (2, 48) {
-            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        let prime_offload = std::env::var_os("__NV_PRIME_RENDER_OFFLOAD");
+        let glx_vendor = std::env::var_os("__GLX_VENDOR_LIBRARY_NAME");
+        let uses_nvidia = webkit_version >= (2, 48)
+            && linux_uses_nvidia_renderer(
+                Path::new("/sys/class/drm"),
+                prime_offload.as_deref(),
+                glx_vendor.as_deref(),
+            );
+        match linux_dmabuf_workaround(webkit_version, uses_nvidia) {
+            Some(LinuxDmabufWorkaround::Disable) => {
+                std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+            }
+            Some(LinuxDmabufWorkaround::ForceShm) => {
+                if std::env::var_os("WEBKIT_DMABUF_RENDERER_FORCE_SHM").is_none() {
+                    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "0");
+                    std::env::set_var("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1");
+                }
+            }
+            None => {}
         }
     }
+    // WebAssembly tier-up kills the renderer on x86-64 CPUs without AVX
+    // (GeoLibre#2087). When a loop inside a WebAssembly function gets hot,
+    // JavaScriptCore performs OSR entry into a JIT tier, and that path runs
+    // `ctiMasmProbeTrampoline`, which spills xmm0-xmm15 with VEX-encoded
+    // `vmovaps` and no runtime AVX check. On a CPU without AVX the first of
+    // those instructions raises SIGILL, the WebKitWebProcess dies, and the
+    // window stays blank forever with nothing shown to the user. It is an
+    // upstream WebKit bug that no GeoLibre code can avoid emitting, and it is
+    // reached in normal use because the app runs WebAssembly (DuckDB-WASM,
+    // Whitebox) in a worker. All we can do is keep JavaScriptCore off the OSR
+    // entry path. WebAssembly still gets baseline-compiled when a function is
+    // called repeatedly, so the cost is bounded (a few times slower on repeated
+    // calls; a single long-running call with a hot loop stays interpreted)
+    // instead of the app being unusable. Verified against WebKitGTK 2.52.6 by
+    // breakpointing the trampoline in the web process: with both options off it
+    // is never entered, with either one on it still is.
+    let cpu_supports_avx = cpu_supports_avx();
+    let kept_on = WASM_OSR_ENTRY_JSC_OPTIONS
+        .into_iter()
+        .find(|option| std::env::var_os(option).is_some_and(|value| !jsc_option_is_off(&value)));
+    if linux_needs_wasm_osr_workaround(cpu_supports_avx, kept_on.is_some()) {
+        for option in WASM_OSR_ENTRY_JSC_OPTIONS {
+            if std::env::var_os(option).is_none() {
+                std::env::set_var(option, "false");
+            }
+        }
+        eprintln!(
+            "GeoLibre: this CPU has no AVX, so WebAssembly tier-up would crash the WebKit \
+             renderer (see GeoLibre issue 2087). {} are off to keep the app running; \
+             WebAssembly-heavy work will be slower.",
+            WASM_OSR_ENTRY_JSC_OPTIONS.join(" and ")
+        );
+    } else if !cpu_supports_avx {
+        if let Some(option) = kept_on {
+            eprintln!(
+                "GeoLibre: this CPU has no AVX, but {option} is set to keep WebAssembly tier-up \
+                 on, so the workaround for GeoLibre issue 2087 was left alone. The renderer can \
+                 still die with SIGILL unless {} are both off.",
+                WASM_OSR_ENTRY_JSC_OPTIONS.join(" and ")
+            );
+        }
+    }
+
     // Prefer portal-backed native dialogs on Linux. This avoids GTK/GIO file
     // metadata warnings that can appear around file and folder pickers.
     if std::env::var_os("GTK_USE_PORTAL").is_none() {
@@ -3361,31 +4502,97 @@ fn configure_linux_webkit() {}
 #[cfg(test)]
 mod tests {
     use super::{
-        child_failure_message, clear_appimage_python_env, client_cert_is_pkcs12,
-        client_cert_password_without_path, ensure_fetchable_url, find_zip_manifest_path,
+        client_cert_is_pkcs12, client_cert_password_without_path, ensure_fetchable_url,
         is_allowed_local_vector_path, is_allowed_project_path, is_disallowed_ip,
-        is_safe_absolute_path, plugin_archive_file_name, resolve_sidecar_in_resource_dir,
+        is_image_picker_path, is_persisted_image_file,
+        is_safe_absolute_path, is_ssrf_guard_error, path_is_under, project_path_string,
+        project_paths_from_args, read_mbtiles_zoom_range, resolve_fetch_timeout_secs, tcp_table_port,
+        MAX_FETCH_TIMEOUT_SECS, REMOTE_TILE_TIMEOUT_SECS, SSRF_BLOCKED_MESSAGE,
+    };
+    #[cfg(target_os = "linux")]
+    use super::{
+        cpu_supports_avx, jsc_option_is_off, linux_dmabuf_workaround,
+        linux_needs_wasm_osr_workaround, linux_uses_nvidia_renderer, nvidia_is_primary_gpu,
+        LinuxDmabufWorkaround, WASM_OSR_ENTRY_JSC_OPTIONS,
+    };
+    // Everything these imports feed is compiled out of the `mas` build, so the
+    // tests that exercise it (and their scaffolding) are gated with it.
+    #[cfg(not(feature = "mas"))]
+    use super::{
+        add_main_sidecar_extras, child_failure_message, clear_appimage_python_env,
+        find_zip_manifest_path, plugin_archive_file_name, resolve_sidecar_in_resource_dir,
         CapturedOutput, CAPTURED_LOG_MAX_LINES, CAPTURED_LOG_REPORTED_LINES, CAPTURED_LOG_SETTLE,
     };
+    #[cfg(not(feature = "mas"))]
     use std::env;
-    use std::ffi::OsStr;
+    #[cfg(not(feature = "mas"))]
+    use std::ffi::{OsStr, OsString};
+    #[cfg(not(feature = "mas"))]
     use std::io::{Cursor, Write};
     use std::net::IpAddr;
+    #[cfg(not(feature = "mas"))]
     use std::path::PathBuf;
+    #[cfg(not(feature = "mas"))]
     use std::process::Command;
+    #[cfg(not(feature = "mas"))]
     use std::sync::Mutex;
+    #[cfg(not(feature = "mas"))]
     use std::time::Duration;
 
     // `std::env::set_var` is process-global, so the tests that stage an AppImage
     // environment must not run concurrently with each other.
+    #[cfg(not(feature = "mas"))]
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn derives_mbtiles_zoom_range_from_tile_rows() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute("CREATE TABLE tiles (zoom_level INTEGER NOT NULL)", [])
+            .unwrap();
+        for zoom in [4, 9, 6] {
+            connection
+                .execute("INSERT INTO tiles (zoom_level) VALUES (?1)", [zoom])
+                .unwrap();
+        }
+
+        assert_eq!(
+            read_mbtiles_zoom_range(&connection, true, true).unwrap(),
+            (Some(4), Some(9))
+        );
+
+        let no_tiles_table = rusqlite::Connection::open_in_memory().unwrap();
+        assert_eq!(
+            read_mbtiles_zoom_range(&no_tiles_table, false, false).unwrap(),
+            (None, None)
+        );
+    }
+
+    #[cfg(not(feature = "mas"))]
+    #[test]
+    fn main_sidecar_installs_postgis_runtime() {
+        let mut command = Command::new("uv");
+        add_main_sidecar_extras(&mut command);
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                OsStr::new("--extra"),
+                OsStr::new("ml"),
+                OsStr::new("--extra"),
+                OsStr::new("postgis"),
+            ]
+        );
+    }
 
     // A throwaway directory tree under the system temp dir that removes itself
     // on drop, so scratch dirs are cleaned up even when an assertion panics.
     // Uses the process id (no rand dependency) and clears any leftover from a
     // prior run at construction.
+    #[cfg(not(feature = "mas"))]
     struct ScratchDir(PathBuf);
 
+    #[cfg(not(feature = "mas"))]
     impl ScratchDir {
         fn new(name: &str) -> Self {
             let dir = std::env::temp_dir().join(format!("geolibre-{name}-{}", std::process::id()));
@@ -3399,15 +4606,210 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "mas"))]
     impl Drop for ScratchDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
+    #[cfg(not(feature = "mas"))]
+    #[test]
+    fn resolves_only_existing_project_arguments() {
+        let root = ScratchDir::new("project-arguments");
+        let short = root.path().join("short.geolibre");
+        let legacy = root.path().join("legacy.geolibre.json");
+        let ordinary_json = root.path().join("ordinary.json");
+        std::fs::write(&short, "{}").unwrap();
+        std::fs::write(&legacy, "{}").unwrap();
+        std::fs::write(&ordinary_json, "{}").unwrap();
+
+        let paths = project_paths_from_args(
+            [
+                OsString::from("--verbose"),
+                OsString::from("short.geolibre"),
+                legacy.clone().into_os_string(),
+                ordinary_json.into_os_string(),
+                OsString::from("missing.geolibre"),
+            ],
+            root.path(),
+        );
+
+        assert_eq!(
+            paths,
+            [
+                project_path_string(&short.canonicalize().unwrap()),
+                project_path_string(&legacy.canonicalize().unwrap()),
+            ]
+        );
+    }
+
+    #[cfg(all(unix, not(feature = "mas")))]
+    #[test]
+    fn rejects_project_named_symlinks_to_other_file_types() {
+        let root = ScratchDir::new("project-argument-symlink");
+        let target = root.path().join("private.json");
+        let link = root.path().join("looks-safe.geolibre");
+        std::fs::write(&target, "{}").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(project_paths_from_args([link.into_os_string()], root.path()).is_empty());
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "mas")))]
+    #[test]
+    fn detects_primary_nvidia_gpu() {
+        let root = ScratchDir::new("nvidia-primary");
+        let device = root.path().join("card0/device");
+        std::fs::create_dir_all(&device).unwrap();
+        std::fs::write(device.join("vendor"), "0x10de\n").unwrap();
+        std::fs::write(device.join("boot_vga"), "1\n").unwrap();
+        std::os::unix::fs::symlink("/sys/bus/pci/drivers/nvidia", device.join("driver")).unwrap();
+
+        assert!(nvidia_is_primary_gpu(root.path()));
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "mas")))]
+    #[test]
+    fn ignores_secondary_nvidia_gpu() {
+        let root = ScratchDir::new("nvidia-secondary");
+        let device = root.path().join("card1/device");
+        std::fs::create_dir_all(&device).unwrap();
+        std::fs::write(device.join("vendor"), "0x10de\n").unwrap();
+        std::fs::write(device.join("boot_vga"), "0\n").unwrap();
+        std::os::unix::fs::symlink("/sys/bus/pci/drivers/nvidia", device.join("driver")).unwrap();
+
+        assert!(!nvidia_is_primary_gpu(root.path()));
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "mas")))]
+    #[test]
+    fn ignores_primary_nvidia_gpu_using_nouveau() {
+        let root = ScratchDir::new("nouveau-primary");
+        let device = root.path().join("card0/device");
+        std::fs::create_dir_all(&device).unwrap();
+        std::fs::write(device.join("vendor"), "0x10de\n").unwrap();
+        std::fs::write(device.join("boot_vga"), "1\n").unwrap();
+        std::os::unix::fs::symlink("/sys/bus/pci/drivers/nouveau", device.join("driver")).unwrap();
+
+        assert!(!nvidia_is_primary_gpu(root.path()));
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "mas")))]
+    #[test]
+    fn detects_explicit_nvidia_renderer_environment() {
+        let root = ScratchDir::new("nvidia-renderer-env");
+
+        assert!(linux_uses_nvidia_renderer(
+            root.path(),
+            Some(OsStr::new("1")),
+            None,
+        ));
+        assert!(linux_uses_nvidia_renderer(
+            root.path(),
+            None,
+            Some(OsStr::new("NVIDIA")),
+        ));
+        assert!(!linux_uses_nvidia_renderer(
+            root.path(),
+            Some(OsStr::new("0")),
+            Some(OsStr::new("mesa")),
+        ));
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "mas")))]
+    #[test]
+    fn selects_modern_shm_fallback_for_current_nvidia_webkitgtk() {
+        assert_eq!(
+            linux_dmabuf_workaround((2, 47), false),
+            Some(LinuxDmabufWorkaround::Disable)
+        );
+        assert_eq!(
+            linux_dmabuf_workaround((2, 51), true),
+            Some(LinuxDmabufWorkaround::Disable)
+        );
+        assert_eq!(
+            linux_dmabuf_workaround((2, 52), true),
+            Some(LinuxDmabufWorkaround::ForceShm)
+        );
+        assert_eq!(linux_dmabuf_workaround((2, 52), false), None);
+    }
+
+    // Regression for issue #2087: on an x86-64 CPU without AVX, WebKitGTK's
+    // WebAssembly OSR entry runs an unconditionally AVX trampoline and takes
+    // the renderer down with SIGILL, so both options have to be pinned off.
+    #[cfg(all(target_os = "linux", not(feature = "mas")))]
+    #[test]
+    fn disables_wasm_osr_entry_only_without_avx() {
+        assert!(linux_needs_wasm_osr_workaround(false, false));
+        assert!(!linux_needs_wasm_osr_workaround(true, false));
+    }
+
+    // Turning either option back on is the escape hatch, and it takes the whole
+    // pair out of GeoLibre's hands: half the workaround costs WebAssembly
+    // performance without saving the renderer.
+    #[cfg(all(target_os = "linux", not(feature = "mas")))]
+    #[test]
+    fn keeps_an_explicit_wasm_osr_setting() {
+        assert!(!linux_needs_wasm_osr_workaround(false, true));
+        assert!(!linux_needs_wasm_osr_workaround(true, true));
+    }
+
+    // An option someone already turned off is not an opt-out, so the other half
+    // of the pair still gets applied. Which values count as off is
+    // JavaScriptCore's rule, verified against WebKitGTK 2.52.6: `false` and
+    // `no` in any case, and `0`, disable an option; `true`, `yes` and `1` turn
+    // it on; and a value it cannot parse leaves the default, which for both of
+    // these options is on.
+    #[cfg(all(target_os = "linux", not(feature = "mas")))]
+    #[test]
+    fn reads_wasm_osr_values_the_way_javascriptcore_does() {
+        for off in ["false", "FALSE", "False", "no", "NO", "No", "0"] {
+            assert!(jsc_option_is_off(OsStr::new(off)), "{off}");
+        }
+        for on in ["true", "TRUE", "1", "yes", "YES", "garbage", ""] {
+            assert!(!jsc_option_is_off(OsStr::new(on)), "{on}");
+        }
+    }
+
+    // Both options are needed: with either one left on, the web process still
+    // enters the trampoline (measured on WebKitGTK 2.52.6). They are read by
+    // JavaScriptCore straight out of the environment, so the names carry the
+    // `JSC_` prefix.
+    #[cfg(all(target_os = "linux", not(feature = "mas")))]
+    #[test]
+    fn pins_both_javascriptcore_wasm_osr_options() {
+        assert_eq!(
+            WASM_OSR_ENTRY_JSC_OPTIONS,
+            ["JSC_useWasmOSR", "JSC_useBBQTierUpChecks"]
+        );
+    }
+
+    // Every architecture other than x86 skips the workaround, and the x86
+    // answer has to come from the running CPU rather than from build flags.
+    #[cfg(all(target_os = "linux", not(feature = "mas")))]
+    #[test]
+    fn reports_avx_support_for_this_cpu() {
+        let supported = cpu_supports_avx();
+        if !cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+            assert!(supported);
+            return;
+        }
+        // Cross-check against the kernel where it reports the flags. A
+        // hypervisor can mask them, and a restricted /proc need not carry a
+        // `flags` line at all, so a missing line means "nothing to compare",
+        // not a failure.
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        let mut flag_lines = cpuinfo.lines().filter(|line| line.starts_with("flags"));
+        if let Some(flags) = flag_lines.next() {
+            assert_eq!(supported, flags.split_whitespace().any(|flag| flag == "avx"));
+        }
+    }
+
     // Regression for issue #1223: installed builds place the bundled sidecar at
     // `<resource_dir>/_up_/_up_/_up_/backend/geolibre_server`, so the resolver
     // must follow the `_up_` chain rather than only checking the resource root.
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn resolves_bundled_sidecar_under_up_prefix() {
         let root = ScratchDir::new("sidecar-up");
@@ -3522,6 +4924,35 @@ mod tests {
     }
 
     #[test]
+    fn ssrf_guard_error_is_detected_through_the_source_chain() {
+        use std::error::Error;
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct Wrapper(Box<dyn Error + Send + Sync>);
+        impl fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                // Deliberately hides the cause, the way reqwest's "error
+                // following redirect" / connector errors hide theirs.
+                write!(f, "error following redirect for url (https://example.com/)")
+            }
+        }
+        impl Error for Wrapper {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(self.0.as_ref())
+            }
+        }
+
+        let blocked = Wrapper(SSRF_BLOCKED_MESSAGE.into());
+        assert!(!blocked.to_string().contains(SSRF_BLOCKED_MESSAGE));
+        assert!(is_ssrf_guard_error(&blocked));
+
+        // A genuine transport failure must stay fallback-eligible.
+        let transport = Wrapper("connection reset by peer".into());
+        assert!(!is_ssrf_guard_error(&transport));
+    }
+
+    #[test]
     fn project_path_guard_allows_projects_and_blocks_secrets() {
         assert!(is_allowed_project_path("/home/u/map.geolibre.json"));
         assert!(is_allowed_project_path("/home/u/map.geolibre"));
@@ -3577,6 +5008,7 @@ mod tests {
         assert!(!is_allowed_local_vector_path("/home/user/file."));
     }
 
+    #[cfg(not(feature = "mas"))]
     fn zip_with_names(names: &[&str]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default()
@@ -3588,12 +5020,14 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    #[cfg(not(feature = "mas"))]
     fn manifest_path(names: &[&str]) -> Option<String> {
         let bytes = zip_with_names(names);
         let archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         find_zip_manifest_path(&archive)
     }
 
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn finds_root_manifest() {
         assert_eq!(
@@ -3602,6 +5036,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn finds_manifest_inside_a_wrapping_folder() {
         assert_eq!(
@@ -3610,6 +5045,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn prefers_root_and_ignores_macosx_metadata() {
         // A root manifest wins over a deeper one.
@@ -3624,17 +5060,20 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn returns_none_without_a_manifest() {
         assert_eq!(manifest_path(&["dist/plugin.js"]), None);
     }
 
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn keeps_safe_plugin_ids() {
         assert_eq!(plugin_archive_file_name("maplibre-foo"), "maplibre-foo.zip");
         assert_eq!(plugin_archive_file_name("foo.bar_2"), "foo.bar_2.zip");
     }
 
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn sanitizes_unsafe_characters_and_traversal() {
         // Path separators and other characters cannot escape the plugins dir;
@@ -3672,6 +5111,7 @@ mod tests {
         assert!(!is_safe_absolute_path("C:")); // drive letter without a separator
     }
 
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn captured_output_keeps_only_the_trailing_lines() {
         let captured = CapturedOutput::new();
@@ -3691,6 +5131,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn captured_output_drops_blank_lines_from_the_tail() {
         let captured = CapturedOutput::new();
@@ -3704,6 +5145,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn child_failure_message_quotes_the_child_output() {
         let captured = CapturedOutput::new();
@@ -3715,6 +5157,7 @@ mod tests {
         assert!(message.contains("error: Extra `notebook` is not defined"));
     }
 
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn child_failure_message_says_so_when_there_was_no_output() {
         let message = child_failure_message("Jupyter server exited.", &CapturedOutput::new());
@@ -3726,7 +5169,7 @@ mod tests {
     // while those lines are still in the pipe, so the report has to wait for the
     // readers to drain. Uses a real child so the race is real: a spawn that
     // writes and exits immediately, reported the way the health waiters do.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(feature = "mas")))]
     #[test]
     fn child_failure_message_waits_for_output_still_in_the_pipe() {
         use std::process::{Command, Stdio};
@@ -3756,6 +5199,7 @@ mod tests {
     // failure mode the capture exists to prevent. (The real-child test above
     // exercises the same path end to end, but its timing is not guaranteed:
     // on a fast machine the reader usually wins on its own.)
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn child_failure_message_waits_for_output_still_in_flight() {
         struct SlowThenEof {
@@ -3785,6 +5229,7 @@ mod tests {
     // aborts with "Failed to import encodings module" before running any code,
     // which is how the Notebook panel and the sidecar died in AppImage builds.
     // Serialized with the other env-mutating test: these share process env.
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn appimage_python_env_is_stripped_from_children() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3826,6 +5271,7 @@ mod tests {
 
     // Outside an AppImage nothing is filtered: a user who deliberately set these
     // for their own Python must keep them.
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn python_env_is_untouched_outside_an_appimage() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3846,6 +5292,7 @@ mod tests {
     // The Jupyter launch sets PYTHONPATH itself (notebook-lib, so `import
     // geolibre` works) before the sanitizer runs; the sanitizer must not
     // overwrite it.
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn a_pythonpath_the_caller_already_set_is_preserved() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3869,6 +5316,7 @@ mod tests {
     // `jupyter`, which spawns kernels holding these same pipe handles, so a
     // grandchild outliving the child keeps the write end open forever. `settle`
     // is bounded for exactly this case.
+    #[cfg(not(feature = "mas"))]
     #[test]
     fn settle_gives_up_on_a_reader_that_never_reaches_eof() {
         struct NeverEnds;
@@ -3891,5 +5339,119 @@ mod tests {
             "settle blocked for {:?}",
             started.elapsed()
         );
+    }
+
+    // The Windows reaper reads the local port out of a DWORD that holds it in
+    // network byte order in its low word. Getting this wrong would match the
+    // wrong listener (or none), so pin the decoding here -- these are pure
+    // functions, so the check runs on every platform even though their only
+    // caller is Windows-only.
+    #[test]
+    fn decodes_a_network_order_port_from_the_tcp_table() {
+        // 8766 = 0x223E; network byte order puts 0x22 first, so the DWORD's low
+        // word reads 0x3E22, and the high word is padding the API does not use.
+        assert_eq!(tcp_table_port(0x0000_3E22), 8766);
+        assert_eq!(tcp_table_port(0xDEAD_3E22), 8766);
+        assert_eq!(tcp_table_port(0x0000_223E), 0x3E22);
+    }
+
+    // Add Vector Layer downloads a whole dataset through the same command that
+    // fetches tiles, so it asks for a longer budget. The clamp is what keeps
+    // that override from becoming a way to disable the timeout entirely.
+    #[test]
+    fn clamps_the_fetch_timeout_into_the_allowed_range() {
+        // No override: the tile-sized default.
+        assert_eq!(resolve_fetch_timeout_secs(None), REMOTE_TILE_TIMEOUT_SECS);
+        // A dataset-sized budget is honored as asked.
+        assert_eq!(resolve_fetch_timeout_secs(Some(180)), 180);
+        // Zero would mean "no timeout" to reqwest, so it is raised to the floor
+        // rather than letting a stalled request hang forever.
+        assert_eq!(resolve_fetch_timeout_secs(Some(0)), REMOTE_TILE_TIMEOUT_SECS);
+        // Below the floor is raised; above the ceiling is capped.
+        assert_eq!(resolve_fetch_timeout_secs(Some(1)), REMOTE_TILE_TIMEOUT_SECS);
+        assert_eq!(
+            resolve_fetch_timeout_secs(Some(u64::MAX)),
+            MAX_FETCH_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn recognizes_only_persisted_image_file_grants() {
+        assert!(is_persisted_image_file(
+            r"\\?\UNC\server\drone photos\IMG_0042.JPEG"
+        ));
+        // TIFF grants may belong to persistent GeoTIFF raster layers, so the
+        // startup migration must leave them intact even though the photo
+        // importer also accepts TIFF images.
+        assert!(!is_persisted_image_file(r"X:\survey\ortho.tif"));
+        // Directory patterns must survive even when their names contain an
+        // image-looking segment, as must unrelated project and vector grants.
+        assert!(!is_persisted_image_file(r"X:\survey\photos\**"));
+        assert!(!is_persisted_image_file(r"X:\survey\map.geolibre"));
+        assert!(!is_persisted_image_file(r"X:\survey\points.geojson"));
+    }
+
+    #[test]
+    fn native_image_picker_rejects_paths_outside_its_filter() {
+        assert!(is_image_picker_path(std::path::Path::new(
+            r"X:\survey\PHOTO.JPEG"
+        )));
+        assert!(is_image_picker_path(std::path::Path::new(
+            r"X:\survey\ortho.tiff"
+        )));
+        assert!(!is_image_picker_path(std::path::Path::new(
+            r"X:\survey\notes.txt"
+        )));
+    }
+
+    // The image-path guard is what keeps the reaper from killing a Jupyter the
+    // user installed themselves: only executables under our own runtime
+    // directory are ours to terminate.
+    #[test]
+    fn recognizes_only_paths_inside_the_runtime_directory() {
+        let root =
+            std::path::Path::new(r"C:\Users\me\AppData\Roaming\org.geolibre.desktop\runtime");
+        assert!(path_is_under(
+            std::path::Path::new(
+                r"C:\Users\me\AppData\Roaming\org.geolibre.desktop\runtime\jupyter-server\Scripts\python.exe"
+            ),
+            root
+        ));
+        // Case and separator differences are not a mismatch on Windows.
+        assert!(path_is_under(
+            std::path::Path::new(
+                r"c:\users\me\appdata\roaming\org.geolibre.desktop\RUNTIME/uv-bin/uv.exe"
+            ),
+            root
+        ));
+        // A sibling directory sharing the prefix is not inside it.
+        assert!(!path_is_under(
+            std::path::Path::new(
+                r"C:\Users\me\AppData\Roaming\org.geolibre.desktop\runtime-old\jupyter-server\python.exe"
+            ),
+            root
+        ));
+        // The user's own Python is left alone.
+        assert!(!path_is_under(
+            std::path::Path::new(r"C:\Program Files\Python312\python.exe"),
+            root
+        ));
+        // A non-ASCII profile name survives the fold: ASCII case folding leaves
+        // it byte-identical on both sides, where Unicode lowercasing could
+        // change its length and misalign the prefix.
+        let unicode_root = std::path::Path::new(r"C:\Users\İŞIL\AppData\Roaming\runtime");
+        assert!(path_is_under(
+            std::path::Path::new(
+                r"C:\Users\İŞIL\AppData\Roaming\runtime\jupyter-server\python.exe"
+            ),
+            unicode_root
+        ));
+        // The directory itself is not "inside" itself, and an empty root never
+        // matches (which would otherwise make every listener look like ours).
+        assert!(!path_is_under(root, root));
+        assert!(!path_is_under(
+            std::path::Path::new(r"C:\anything"),
+            std::path::Path::new("")
+        ));
     }
 }
