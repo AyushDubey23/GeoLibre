@@ -394,6 +394,34 @@ describe("uploadProjectToShare", () => {
     assert.equal(body.password, "secretpassword");
     assert.equal(result.role, "view");
     assert.equal(result.hasPassword, true);
+    assert.deepEqual(result.unconfirmedSettings, []);
+  });
+
+  it("flags requested settings a URL-only response did not confirm", async () => {
+    // A server that predates link settings ignores the fields and answers with
+    // the plain v1 response, so none of them may be reported as applied.
+    const { fn } = fakeFetch(201, { project: PROJECT_DTO });
+    const result = await uploadProjectToShare({
+      ...baseArgs,
+      role: "view",
+      expiresIn: "24h",
+      password: "secretpassword",
+      fetchImpl: fn,
+    });
+    assert.deepEqual(result.unconfirmedSettings, ["role", "expiry", "password"]);
+  });
+
+  it("does not flag the default edit role on a URL-only response", async () => {
+    const { fn } = fakeFetch(201, { project: PROJECT_DTO });
+    const result = await uploadProjectToShare({ ...baseArgs, role: "edit", fetchImpl: fn });
+    assert.deepEqual(result.unconfirmedSettings, []);
+  });
+
+  it("fails closed to the view role when the upload response sends an unknown one", async () => {
+    const { fn } = fakeFetch(201, { project: { ...PROJECT_DTO, role: "owner" } });
+    const result = await uploadProjectToShare({ ...baseArgs, role: "comment", fetchImpl: fn });
+    assert.equal(result.role, "view");
+    assert.deepEqual(result.unconfirmedSettings, ["role"]);
   });
 });
 

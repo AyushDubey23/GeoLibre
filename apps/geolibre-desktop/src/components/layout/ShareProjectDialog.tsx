@@ -48,6 +48,7 @@ import {
   uploadProjectToShare,
   type ActiveShare,
   type ShareExpiry,
+  type ShareLinkSetting,
   type ShareRole,
   type ShareUploadErrorCode,
   type ShareUploadResult,
@@ -244,6 +245,14 @@ const ROLE_LABEL_KEYS = {
   edit: "share.roleEditShort",
 } as const satisfies Record<ShareRole, string>;
 
+// Names for the link settings a server may have ignored (see
+// ShareUploadResult.unconfirmedSettings), reusing the create form's labels.
+const UNCONFIRMED_SETTING_LABEL_KEYS = {
+  role: "share.role",
+  expiry: "share.expiry",
+  password: "share.passwordSetting",
+} as const satisfies Record<ShareLinkSetting, string>;
+
 export function ShareProjectDialog({
   open,
   onOpenChange,
@@ -288,6 +297,7 @@ export function ShareProjectDialog({
 
   const abortRef = useRef<AbortController | null>(null);
   const sharesAbortRef = useRef<AbortController | null>(null);
+  const revokeAbortRef = useRef<AbortController | null>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
   const getTokenButtonRef = useRef<HTMLButtonElement>(null);
   const copyTimeoutRef = useRef<number | null>(null);
@@ -395,6 +405,9 @@ export function ShareProjectDialog({
       sharesAbortRef.current?.abort();
       sharesAbortRef.current = null;
       setLoadingShares(false);
+      revokeAbortRef.current?.abort();
+      revokeAbortRef.current = null;
+      setRevokingId(null);
     }
   }, [open, currentTitle, hasToken, loadActiveShares]);
 
@@ -501,7 +514,6 @@ export function ShareProjectDialog({
       });
       setRedactedCount(removed);
       setResult(uploaded);
-      void loadActiveShares();
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
       // A missing account username gets dedicated, actionable UI (a deep link to
@@ -537,15 +549,26 @@ export function ShareProjectDialog({
     // not be enough to do it. `window.confirm` is blocking and matches how the
     // rest of the app gates destructive actions.
     if (!window.confirm(t("share.revokeConfirm"))) return;
+    revokeAbortRef.current?.abort();
+    const controller = new AbortController();
+    revokeAbortRef.current = controller;
     setRevokingId(shareId);
     setRevokeError(null);
     try {
-      await revokeShare({ token: await resolveAuthToken(), shareId });
+      const token = await resolveAuthToken();
+      await revokeShare({ token, shareId, signal: controller.signal });
+      if (revokeAbortRef.current !== controller) return;
       setActiveShares((prev) => prev.filter((s) => s.id !== shareId));
     } catch (err) {
+      // Closing the dialog aborts the request, like the upload and list loads.
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (revokeAbortRef.current !== controller) return;
       setRevokeError(err instanceof Error ? err.message : t("share.revokeErrorFallback"));
     } finally {
-      setRevokingId(null);
+      if (revokeAbortRef.current === controller) {
+        revokeAbortRef.current = null;
+        setRevokingId(null);
+      }
     }
   };
 
@@ -679,6 +702,19 @@ export function ShareProjectDialog({
             {redactedCount > 0 ? (
               <p className="rounded-md bg-muted p-2 text-sm text-muted-foreground">
                 {t("share.credentialsRemoved", { count: redactedCount })}
+              </p>
+            ) : null}
+            {result.unconfirmedSettings.length > 0 ? (
+              <p
+                role="alert"
+                className="rounded-md border border-amber-500/50 bg-amber-500/10 p-2 text-sm"
+              >
+                {t("share.settingsNotApplied", {
+                  shareHost,
+                  settings: result.unconfirmedSettings
+                    .map((setting) => t(UNCONFIRMED_SETTING_LABEL_KEYS[setting]))
+                    .join(", "),
+                })}
               </p>
             ) : null}
             <p className="text-sm text-muted-foreground">{t("share.liveAt")}</p>

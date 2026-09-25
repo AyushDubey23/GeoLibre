@@ -75,7 +75,16 @@ export interface ShareUploadResult {
   role?: ShareRole;
   expiresAt?: string | null;
   hasPassword?: boolean;
+  /**
+   * Link settings the caller requested but the server's response did not
+   * confirm. A server that predates these settings ignores the fields and
+   * returns a plain link, so the UI must not present them as applied.
+   */
+  unconfirmedSettings: ShareLinkSetting[];
 }
+
+/** A link setting whose application the server must confirm in its response. */
+export type ShareLinkSetting = "role" | "expiry" | "password";
 
 export interface ShareUploadOptions {
   token: string;
@@ -336,6 +345,17 @@ export async function uploadProjectToShare(
   if (!project?.projectUrl || !project.rawJsonUrl) {
     throw new Error(`${hostLabel} returned an unexpected response.`);
   }
+  // Normalized like the Active Shares list, so an unknown role from the server
+  // fails closed to "view" rather than flowing through unchecked.
+  const role = project.role === undefined ? undefined : normalizeShareRole(project.role);
+  // "edit" is the full-access default, so a server that ignores the role field
+  // still honors it; a restricted role, an expiry, or a password must be echoed.
+  const unconfirmedSettings: ShareLinkSetting[] = [];
+  if (options.role && options.role !== "edit" && role !== options.role) {
+    unconfirmedSettings.push("role");
+  }
+  if (options.expiresIn && !project.expiresAt) unconfirmedSettings.push("expiry");
+  if (options.password && project.hasPassword !== true) unconfirmedSettings.push("password");
   return {
     id: project.id,
     username: project.username ?? "",
@@ -343,9 +363,10 @@ export async function uploadProjectToShare(
     projectUrl: project.projectUrl,
     viewerUrl: project.viewerUrl ?? "",
     rawJsonUrl: project.rawJsonUrl,
-    role: project.role,
+    role,
     expiresAt: project.expiresAt,
     hasPassword: project.hasPassword,
+    unconfirmedSettings,
   };
 }
 
@@ -363,7 +384,7 @@ export interface FetchSharesOptions {
 export async function fetchProjectShares(options: FetchSharesOptions): Promise<ActiveShare[]> {
   const token = options.token.trim();
   if (!token) {
-    throw new Error("Add a share.geolibre.app API token in Settings before managing shares.");
+    throw new Error("Add a share API token in Settings before managing shares.");
   }
 
   const resolved = options.baseUrl ?? resolveShareBaseUrl();
@@ -386,7 +407,7 @@ export async function fetchProjectShares(options: FetchSharesOptions): Promise<A
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") throw error;
-    throw new Error("Could not reach share.geolibre.app. Check your internet connection.");
+    throw new Error(`Could not reach ${hostOf(base)}. Check your internet connection.`);
   }
 
   if (response.status === 401 || response.status === 403) {
@@ -465,7 +486,7 @@ export async function revokeShare(options: RevokeShareOptions): Promise<void> {
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") throw error;
-    throw new Error("Could not reach share.geolibre.app to revoke share.");
+    throw new Error(`Could not reach ${hostOf(base)} to revoke share.`);
   }
 
   if (response.status === 401 || response.status === 403) {
